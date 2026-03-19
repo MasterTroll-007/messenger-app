@@ -305,6 +305,15 @@ app.on('second-instance', () => {
 // Auto-updater via GitHub releases
 autoUpdater.autoDownload = false;
 autoUpdater.autoInstallOnAppQuit = true;
+autoUpdater.on('checking-for-update', () => {
+  console.log('NAV updater: checking for updates...');
+});
+
+autoUpdater.on('update-not-available', () => {
+  console.log('NAV updater: no update available');
+});
+
+let progressWin = null;
 
 autoUpdater.on('update-available', (info) => {
   dialog.showMessageBox(mainWindow, {
@@ -315,12 +324,50 @@ autoUpdater.on('update-available', (info) => {
     defaultId: 0,
   }).then(({ response }) => {
     if (response === 0) {
+      // Show progress window
+      progressWin = new BrowserWindow({
+        width: 350,
+        height: 120,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        closable: false,
+        frame: false,
+        parent: mainWindow,
+        modal: true,
+        webPreferences: { nodeIntegration: false },
+      });
+      progressWin.loadURL(`data:text/html,
+        <html><body style="margin:0;padding:20px;font-family:Arial;background:#1a1a2e;color:white;display:flex;flex-direction:column;justify-content:center;">
+          <div style="font-size:14px;margin-bottom:12px;">Stahování aktualizace...</div>
+          <div style="background:#333;border-radius:8px;height:16px;overflow:hidden;">
+            <div id="bar" style="background:linear-gradient(90deg,#0095F6,#0078D4);height:100%;width:0%;transition:width 0.3s;border-radius:8px;"></div>
+          </div>
+          <div id="pct" style="font-size:12px;margin-top:8px;color:#aaa;">0%</div>
+        </body></html>
+      `);
       autoUpdater.downloadUpdate();
     }
   });
 });
 
+autoUpdater.on('download-progress', (progress) => {
+  const pct = Math.round(progress.percent);
+  if (progressWin && !progressWin.isDestroyed()) {
+    progressWin.webContents.executeJavaScript(`
+      document.getElementById('bar').style.width = '${pct}%';
+      document.getElementById('pct').textContent = '${pct}% (${Math.round(progress.transferred / 1024 / 1024)}/${Math.round(progress.total / 1024 / 1024)} MB)';
+    `).catch(() => {});
+  }
+  if (mainWindow) mainWindow.setProgressBar(pct / 100);
+});
+
 autoUpdater.on('update-downloaded', () => {
+  if (progressWin && !progressWin.isDestroyed()) {
+    progressWin.close();
+    progressWin = null;
+  }
+  if (mainWindow) mainWindow.setProgressBar(-1);
   dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'Aktualizace připravena',
@@ -331,7 +378,19 @@ autoUpdater.on('update-downloaded', () => {
   });
 });
 
-autoUpdater.on('error', () => {}); // Silent fail
+autoUpdater.on('error', (err) => {
+  console.log('NAV updater error:', err.message);
+  if (progressWin && !progressWin.isDestroyed()) {
+    progressWin.close();
+    progressWin = null;
+  }
+  if (mainWindow) mainWindow.setProgressBar(-1);
+  dialog.showMessageBox(mainWindow, {
+    type: 'error',
+    title: 'Chyba aktualizace',
+    message: `Aktualizace selhala: ${err.message}`,
+  });
+});
 
 app.whenReady().then(() => {
   // Register protocol handler for local audio files
