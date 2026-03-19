@@ -316,7 +316,14 @@ autoUpdater.on('update-not-available', () => {
 let progressWin = null;
 
 autoUpdater.on('update-available', (info) => {
-  dialog.showMessageBox(mainWindow, {
+  console.log('NAV update available:', info.version);
+  // Wait for window to be ready
+  const showDialog = () => {
+    if (!mainWindow || !mainWindow.isVisible()) {
+      setTimeout(showDialog, 1000);
+      return;
+    }
+    dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'Nová verze k dispozici',
     message: `Je dostupná nová verze: v${info.version}`,
@@ -349,6 +356,8 @@ autoUpdater.on('update-available', (info) => {
       autoUpdater.downloadUpdate();
     }
   });
+  };
+  showDialog();
 });
 
 autoUpdater.on('download-progress', (progress) => {
@@ -405,8 +414,8 @@ app.whenReady().then(() => {
   createTray();
   createMenu();
 
-  // Check for updates 5 seconds after start
-  setTimeout(() => autoUpdater.checkForUpdates(), 5000);
+  // Check for updates shortly after start
+  setTimeout(() => autoUpdater.checkForUpdates(), 1000);
 });
 
 app.on('before-quit', () => {
