@@ -51,9 +51,12 @@ const fs = require('fs');
 function getNotificationSoundPath() {
   const custom = path.join(userDataPath, 'notification-custom.mp3');
   if (fs.existsSync(custom)) return custom;
+  // Check extraResources first (real file, not inside asar)
+  const prod = path.join(process.resourcesPath, 'notification.mp3');
+  if (fs.existsSync(prod) && !prod.includes('app.asar')) return prod;
+  // Dev mode fallback
   const dev = path.join(__dirname, 'assets', 'notification.mp3');
-  if (fs.existsSync(dev)) return dev;
-  return path.join(process.resourcesPath, 'notification.mp3');
+  return dev;
 }
 
 // Protocol handler is registered in app.whenReady below
