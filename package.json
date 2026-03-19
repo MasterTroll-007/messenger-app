@@ -31,6 +31,9 @@
       "uninstallerIcon": "assets/icon.ico",
       "installerHeaderIcon": "assets/icon.ico"
     },
+    "extraResources": [
+      { "from": "assets/notification.mp3", "to": "notification.mp3" }
+    ],
     "forceCodeSigning": false,
     "publish": {
       "provider": "github",

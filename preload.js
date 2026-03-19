@@ -1,7 +1,19 @@
 const { ipcRenderer } = require('electron');
 
-// Direct IPC function (usable within preload context)
+// Direct IPC functions
 const sendBadge = (dataUrl) => ipcRenderer.send('set-badge', dataUrl);
+const sendTrayBadge = (dataUrl) => ipcRenderer.send('set-tray-badge', dataUrl);
+const selectNotificationSound = () => ipcRenderer.send('select-notification-sound');
+
+
+// Play sound via main process IPC
+function playNotificationSound() {
+  ipcRenderer.send('play-notification-sound');
+}
+
+ipcRenderer.on('open-sound-picker', () => {
+  selectNotificationSound();
+});
 
 // Inject custom CSS, sidebar toggle, and resizable panels
 window.addEventListener('DOMContentLoaded', () => {
@@ -221,10 +233,22 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
   // --- Init ---
+  let waitAttempts = 0;
   const waitForLoad = setInterval(() => {
+    waitAttempts++;
     const nav = document.querySelector('[aria-label="Seznam konverzací"]');
+    if (waitAttempts % 5 === 0) {
+      console.log('NAV waitForLoad attempt', waitAttempts, 'nav found:', !!nav);
+      if (!nav) {
+        // Log all navigation elements for debugging
+        document.querySelectorAll('[role="navigation"]').forEach((el, i) => {
+          console.log('NAV nav[' + i + ']:', el.getAttribute('aria-label'));
+        });
+      }
+    }
     if (!nav) return;
 
+    console.log('NAV found! Initializing...');
     clearInterval(waitForLoad);
 
     // Restore saved layout state
@@ -394,6 +418,13 @@ window.addEventListener('DOMContentLoaded', () => {
         document.querySelectorAll('.has-unread').forEach(el => el.classList.remove('has-unread'));
       }
 
+      // Play sound if new unread messages appeared
+      console.log('NAV unread:', unreadCount, 'last:', lastBadgeCount);
+      if (unreadCount > lastBadgeCount && lastBadgeCount >= 0) {
+        console.log('NAV playing sound!');
+        playNotificationSound();
+      }
+
       // Update taskbar badge
       if (unreadCount !== lastBadgeCount) {
         lastBadgeCount = unreadCount;
@@ -403,15 +434,19 @@ window.addEventListener('DOMContentLoaded', () => {
           pulseInterval = null;
         }
         if (unreadCount > 0) {
-          // Start pulsing - show/hide
+          const badgeImg = createBadgeDataUrl(unreadCount);
+          // Tray - static badge
+          sendTrayBadge(badgeImg);
+          // Taskbar - pulsing
           let pulseVisible = true;
-          sendBadge(createBadgeDataUrl(unreadCount));
+          sendBadge(badgeImg);
           pulseInterval = setInterval(() => {
             pulseVisible = !pulseVisible;
-            sendBadge(pulseVisible ? createBadgeDataUrl(unreadCount) : null);
+            sendBadge(pulseVisible ? badgeImg : null);
           }, 800);
         } else {
           sendBadge(null);
+          sendTrayBadge(null);
         }
       }
     };

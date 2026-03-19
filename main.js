@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain, dialog, protocol } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 
@@ -12,13 +12,60 @@ if (!gotLock) {
   app.quit();
 }
 
+// Register custom protocol before app ready (bypasses CSP for local audio)
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'messenger-asset', privileges: { bypassCSP: true, stream: true } }
+]);
+
 let mainWindow;
 let tray;
 let isQuitting = false;
 
 const MESSENGER_URL = 'https://www.messenger.com';
 
-// IPC handler for badge overlay from renderer
+// IPC handler for custom notification sound selection
+ipcMain.on('select-notification-sound', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Vyber zvuk oznámení',
+    filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
+    properties: ['openFile'],
+  });
+  if (!result.canceled && result.filePaths[0]) {
+    const fs = require('fs');
+    const dest = path.join(userDataPath, 'notification-custom.mp3');
+    fs.copyFileSync(result.filePaths[0], dest);
+    mainWindow.webContents.send('notification-sound-updated', dest);
+  }
+});
+
+ipcMain.on('reset-notification-sound', () => {
+  const fs = require('fs');
+  const custom = path.join(userDataPath, 'notification-custom.mp3');
+  if (fs.existsSync(custom)) fs.unlinkSync(custom);
+  mainWindow.webContents.send('notification-sound-updated', null);
+});
+
+// Notification sound
+const fs = require('fs');
+
+function getNotificationSoundPath() {
+  const custom = path.join(userDataPath, 'notification-custom.mp3');
+  if (fs.existsSync(custom)) return custom;
+  const dev = path.join(__dirname, 'assets', 'notification.mp3');
+  if (fs.existsSync(dev)) return dev;
+  return path.join(process.resourcesPath, 'notification.mp3');
+}
+
+// Protocol handler is registered in app.whenReady below
+
+ipcMain.on('play-notification-sound', () => {
+  const soundPath = getNotificationSoundPath();
+  console.log('NAV playing sound:', soundPath);
+  const { exec } = require('child_process');
+  exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName presentationCore; $p = New-Object system.windows.media.mediaplayer; $p.open([uri]'${soundPath.replace(/'/g, "''")}'); Start-Sleep -Milliseconds 300; $p.Play(); Start-Sleep -Seconds 3"`);
+});
+
+// IPC handler for badge overlay (taskbar - pulsing)
 ipcMain.on('set-badge', (event, dataUrl) => {
   if (!mainWindow) return;
   if (dataUrl) {
@@ -26,6 +73,19 @@ ipcMain.on('set-badge', (event, dataUrl) => {
     mainWindow.setOverlayIcon(icon, 'Nepřečtené zprávy');
   } else {
     mainWindow.setOverlayIcon(null, '');
+  }
+});
+
+// IPC handler for tray badge (static, no pulsing)
+ipcMain.on('set-tray-badge', (event, dataUrl) => {
+  if (!tray) return;
+  if (dataUrl) {
+    const icon = nativeImage.createFromDataURL(dataUrl).resize({ width: 16, height: 16 });
+    tray.setImage(icon);
+  } else {
+    const iconPath = path.join(__dirname, 'assets', 'icon.png');
+    const originalIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+    if (!originalIcon.isEmpty()) tray.setImage(originalIcon);
   }
 });
 
@@ -41,6 +101,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: false,
       spellcheck: true,
       partition: 'persist:messenger',
     },
@@ -58,7 +119,8 @@ function createWindow() {
   mainWindow.loadURL(MESSENGER_URL);
 
   // Forward console logs from renderer to main process
-  mainWindow.webContents.on('console-message', (event, level, message) => {
+  mainWindow.webContents.on('console-message', (e) => {
+    const message = e.message || '';
     if (message.startsWith('NAV') || message.startsWith('  ')) {
       console.log('[renderer]', message);
     }
@@ -171,6 +233,19 @@ function createMenu() {
         },
         { type: 'separator' },
         {
+          label: 'Změnit zvuk oznámení...',
+          click: () => {
+            mainWindow.webContents.send('open-sound-picker');
+          },
+        },
+        {
+          label: 'Výchozí zvuk oznámení',
+          click: () => {
+            ipcMain.emit('reset-notification-sound');
+          },
+        },
+        { type: 'separator' },
+        {
           label: 'Ukoncit',
           accelerator: 'CmdOrCtrl+Q',
           click: () => {
@@ -259,6 +334,14 @@ autoUpdater.on('update-downloaded', () => {
 autoUpdater.on('error', () => {}); // Silent fail
 
 app.whenReady().then(() => {
+  // Register protocol handler for local audio files
+  protocol.handle('messenger-asset', () => {
+    const soundPath = getNotificationSoundPath();
+    return new Response(fs.readFileSync(soundPath), {
+      headers: { 'Content-Type': 'audio/mpeg' }
+    });
+  });
+
   createWindow();
   createTray();
   createMenu();
