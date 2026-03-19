@@ -333,24 +333,26 @@ autoUpdater.on('update-available', (info) => {
     if (response === 0) {
       // Show progress window
       progressWin = new BrowserWindow({
-        width: 350,
-        height: 120,
+        width: 400,
+        height: 130,
         resizable: false,
         minimizable: false,
         maximizable: false,
         closable: false,
         frame: false,
+        center: true,
         parent: mainWindow,
         modal: true,
+        transparent: true,
         webPreferences: { nodeIntegration: false },
       });
       progressWin.loadURL(`data:text/html,
-        <html><body style="margin:0;padding:20px;font-family:Arial;background:#1a1a2e;color:white;display:flex;flex-direction:column;justify-content:center;">
-          <div style="font-size:14px;margin-bottom:12px;">Stahování aktualizace...</div>
-          <div style="background:#333;border-radius:8px;height:16px;overflow:hidden;">
+        <html><body style="margin:0;padding:24px;font-family:Arial;background:#1a1a2e;color:white;display:flex;flex-direction:column;justify-content:center;height:calc(100vh - 48px);border-radius:12px;border:1px solid #333;">
+          <div style="font-size:14px;margin-bottom:14px;font-weight:bold;">Stahování aktualizace...</div>
+          <div style="background:#333;border-radius:8px;height:18px;overflow:hidden;">
             <div id="bar" style="background:linear-gradient(90deg,#0095F6,#0078D4);height:100%;width:0%;transition:width 0.3s;border-radius:8px;"></div>
           </div>
-          <div id="pct" style="font-size:12px;margin-top:8px;color:#aaa;">0%</div>
+          <div id="pct" style="font-size:12px;margin-top:10px;color:#aaa;">0%</div>
         </body></html>
       `);
       autoUpdater.downloadUpdate();
@@ -383,7 +385,8 @@ autoUpdater.on('update-downloaded', () => {
     message: 'Aktualizace byla stažena. Aplikace se restartuje a nainstaluje novou verzi.',
     buttons: ['Restartovat'],
   }).then(() => {
-    autoUpdater.quitAndInstall();
+    // isSilent=true: no NSIS UI, isForceRunAfter=true: restart app after install
+    autoUpdater.quitAndInstall(true, true);
   });
 });
 
