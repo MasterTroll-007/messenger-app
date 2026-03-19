@@ -1,0 +1,35 @@
+{
+  "name": "messenger-app",
+  "version": "1.0.0",
+  "description": "Custom Facebook Messenger desktop app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win"
+  },
+  "keywords": [
+    "messenger",
+    "facebook",
+    "chat"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "build": {
+    "appId": "com.custom.messenger",
+    "productName": "Messenger",
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false
+    },
+    "forceCodeSigning": false
+  },
+  "devDependencies": {
+    "electron": "^41.0.3",
+    "electron-builder": "^26.8.1"
+  }
+}
