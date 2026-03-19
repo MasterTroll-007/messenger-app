@@ -20,16 +20,31 @@
     "productName": "Messenger",
     "win": {
       "target": "nsis",
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.ico"
     },
     "nsis": {
-      "oneClick": true,
-      "allowToChangeInstallationDirectory": false
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "allowElevation": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico"
     },
-    "forceCodeSigning": false
+    "forceCodeSigning": false,
+    "publish": {
+      "provider": "github",
+      "owner": "MasterTroll-007",
+      "repo": "messenger-app"
+    }
   },
   "devDependencies": {
     "electron": "^41.0.3",
-    "electron-builder": "^26.8.1"
+    "electron-builder": "^26.8.1",
+    "png-to-ico": "^3.0.1",
+    "rcedit": "^5.0.2"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3"
   }
 }

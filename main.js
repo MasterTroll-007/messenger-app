@@ -1,5 +1,16 @@
-const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
+
+// Store user data in a fixed location (not temp) so login persists
+const userDataPath = path.join(app.getPath('appData'), 'MessengerApp');
+app.setPath('userData', userDataPath);
+
+// Prevent multiple instances
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+}
 
 let mainWindow;
 let tray;
@@ -207,10 +218,53 @@ app.on('ready', () => {
   });
 });
 
+// When a second instance tries to start, focus the existing window
+app.on('second-instance', () => {
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
+// Auto-updater via GitHub releases
+autoUpdater.autoDownload = false;
+autoUpdater.autoInstallOnAppQuit = true;
+
+autoUpdater.on('update-available', (info) => {
+  dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: 'Nová verze k dispozici',
+    message: `Je dostupná nová verze: v${info.version}`,
+    buttons: ['Aktualizovat', 'Později'],
+    defaultId: 0,
+  }).then(({ response }) => {
+    if (response === 0) {
+      autoUpdater.downloadUpdate();
+    }
+  });
+});
+
+autoUpdater.on('update-downloaded', () => {
+  dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: 'Aktualizace připravena',
+    message: 'Aktualizace byla stažena. Aplikace se restartuje a nainstaluje novou verzi.',
+    buttons: ['Restartovat'],
+  }).then(() => {
+    autoUpdater.quitAndInstall();
+  });
+});
+
+autoUpdater.on('error', () => {}); // Silent fail
+
 app.whenReady().then(() => {
   createWindow();
   createTray();
   createMenu();
+
+  // Check for updates 5 seconds after start
+  setTimeout(() => autoUpdater.checkForUpdates(), 5000);
 });
 
 app.on('before-quit', () => {
