@@ -1,6 +1,6 @@
 {
   "name": "messenger-app",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Custom Facebook Messenger desktop app",
   "main": "main.js",
   "scripts": {
