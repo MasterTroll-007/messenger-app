@@ -313,8 +313,6 @@ autoUpdater.on('update-not-available', () => {
   console.log('NAV updater: no update available');
 });
 
-let progressWin = null;
-
 autoUpdater.on('update-available', (info) => {
   console.log('NAV update available:', info.version);
   // Wait for window to be ready
@@ -331,30 +329,9 @@ autoUpdater.on('update-available', (info) => {
     defaultId: 0,
   }).then(({ response }) => {
     if (response === 0) {
-      // Show progress window
-      progressWin = new BrowserWindow({
-        width: 400,
-        height: 130,
-        resizable: false,
-        minimizable: false,
-        maximizable: false,
-        closable: false,
-        frame: false,
-        center: true,
-        parent: mainWindow,
-        modal: true,
-        transparent: true,
-        webPreferences: { nodeIntegration: false },
-      });
-      progressWin.loadURL(`data:text/html,
-        <html><body style="margin:0;padding:24px;font-family:Arial;background:#1a1a2e;color:white;display:flex;flex-direction:column;justify-content:center;height:calc(100vh - 48px);border-radius:12px;border:1px solid #333;">
-          <div style="font-size:14px;margin-bottom:14px;font-weight:bold;">Stahování aktualizace...</div>
-          <div style="background:#333;border-radius:8px;height:18px;overflow:hidden;">
-            <div id="bar" style="background:linear-gradient(90deg,#0095F6,#0078D4);height:100%;width:0%;transition:width 0.3s;border-radius:8px;"></div>
-          </div>
-          <div id="pct" style="font-size:12px;margin-top:10px;color:#aaa;">0%</div>
-        </body></html>
-      `);
+      // Show progress in title bar + taskbar
+      mainWindow.setTitle('Messenger - Stahování aktualizace... 0%');
+      mainWindow.setProgressBar(0);
       autoUpdater.downloadUpdate();
     }
   });
@@ -364,39 +341,35 @@ autoUpdater.on('update-available', (info) => {
 
 autoUpdater.on('download-progress', (progress) => {
   const pct = Math.round(progress.percent);
-  if (progressWin && !progressWin.isDestroyed()) {
-    progressWin.webContents.executeJavaScript(`
-      document.getElementById('bar').style.width = '${pct}%';
-      document.getElementById('pct').textContent = '${pct}% (${Math.round(progress.transferred / 1024 / 1024)}/${Math.round(progress.total / 1024 / 1024)} MB)';
-    `).catch(() => {});
+  const mb = Math.round(progress.transferred / 1024 / 1024);
+  const totalMb = Math.round(progress.total / 1024 / 1024);
+  if (mainWindow) {
+    mainWindow.setTitle(`Messenger - Stahování aktualizace... ${pct}% (${mb}/${totalMb} MB)`);
+    mainWindow.setProgressBar(pct / 100);
   }
-  if (mainWindow) mainWindow.setProgressBar(pct / 100);
 });
 
 autoUpdater.on('update-downloaded', () => {
-  if (progressWin && !progressWin.isDestroyed()) {
-    progressWin.close();
-    progressWin = null;
+  if (mainWindow) {
+    mainWindow.setTitle('Messenger');
+    mainWindow.setProgressBar(-1);
   }
-  if (mainWindow) mainWindow.setProgressBar(-1);
   dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'Aktualizace připravena',
-    message: 'Aktualizace byla stažena. Aplikace se restartuje a nainstaluje novou verzi.',
-    buttons: ['Restartovat'],
+    message: 'Aktualizace byla stažena. Aplikace se nyní restartuje.',
+    buttons: ['OK'],
   }).then(() => {
-    // isSilent=true: no NSIS UI, isForceRunAfter=true: restart app after install
     autoUpdater.quitAndInstall(true, true);
   });
 });
 
 autoUpdater.on('error', (err) => {
   console.log('NAV updater error:', err.message);
-  if (progressWin && !progressWin.isDestroyed()) {
-    progressWin.close();
-    progressWin = null;
+  if (mainWindow) {
+    mainWindow.setTitle('Messenger');
+    mainWindow.setProgressBar(-1);
   }
-  if (mainWindow) mainWindow.setProgressBar(-1);
   dialog.showMessageBox(mainWindow, {
     type: 'error',
     title: 'Chyba aktualizace',
