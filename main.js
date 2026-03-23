@@ -1,6 +1,7 @@
 const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain, dialog, protocol } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
+const fs = require('fs');
 
 // Store user data in a fixed location (not temp) so login persists
 const userDataPath = path.join(app.getPath('appData'), 'MessengerApp');
@@ -20,8 +21,32 @@ protocol.registerSchemesAsPrivileged([
 let mainWindow;
 let tray;
 let isQuitting = false;
+let isMuted = false;
+
+// Settings persistence
+const settingsPath = path.join(userDataPath, 'settings.json');
+
+function loadSettings() {
+  try {
+    if (fs.existsSync(settingsPath)) {
+      const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+      isMuted = !!data.muted;
+    }
+  } catch { /* ignore */ }
+}
+
+function saveSettings() {
+  try {
+    let data = {};
+    try { data = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { /* ignore */ }
+    data.muted = isMuted;
+    fs.writeFileSync(settingsPath, JSON.stringify(data));
+  } catch { /* ignore */ }
+}
 
 const MESSENGER_URL = 'https://www.messenger.com';
+
+loadSettings();
 
 // IPC handler for custom notification sound selection
 ipcMain.on('select-notification-sound', async () => {
@@ -31,7 +56,6 @@ ipcMain.on('select-notification-sound', async () => {
     properties: ['openFile'],
   });
   if (!result.canceled && result.filePaths[0]) {
-    const fs = require('fs');
     const dest = path.join(userDataPath, 'notification-custom.mp3');
     fs.copyFileSync(result.filePaths[0], dest);
     mainWindow.webContents.send('notification-sound-updated', dest);
@@ -39,14 +63,12 @@ ipcMain.on('select-notification-sound', async () => {
 });
 
 ipcMain.on('reset-notification-sound', () => {
-  const fs = require('fs');
   const custom = path.join(userDataPath, 'notification-custom.mp3');
   if (fs.existsSync(custom)) fs.unlinkSync(custom);
   mainWindow.webContents.send('notification-sound-updated', null);
 });
 
 // Notification sound
-const fs = require('fs');
 
 function getNotificationSoundPath() {
   const custom = path.join(userDataPath, 'notification-custom.mp3');
@@ -61,7 +83,20 @@ function getNotificationSoundPath() {
 
 // Protocol handler is registered in app.whenReady below
 
+ipcMain.on('get-mute-state', (event) => {
+  event.returnValue = isMuted;
+});
+
+ipcMain.on('set-mute-state', (event, muted) => {
+  isMuted = !!muted;
+  saveSettings();
+  // Update menus to reflect new state
+  rebuildMenus();
+  if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
+});
+
 ipcMain.on('play-notification-sound', () => {
+  if (isMuted) return;
   const soundPath = getNotificationSoundPath();
   console.log('NAV playing sound:', soundPath);
   const { exec } = require('child_process');
@@ -180,7 +215,6 @@ function createWindow() {
 }
 
 function createTray() {
-  const fs = require('fs');
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
 
   if (!fs.existsSync(iconPath)) {
@@ -195,12 +229,46 @@ function createTray() {
   }
 
   tray = new Tray(trayIcon);
+  updateTrayMenu();
+  tray.setToolTip('Messenger');
+  tray.on('click', () => {
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
   const contextMenu = Menu.buildFromTemplate([
     {
       label: 'Otevrit Messenger',
       click: () => {
         mainWindow.show();
         mainWindow.focus();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Ztlumit zvuky',
+      type: 'checkbox',
+      checked: isMuted,
+      click: (menuItem) => {
+        isMuted = menuItem.checked;
+        saveSettings();
+        rebuildMenus();
+        if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
+      },
+    },
+    {
+      label: 'Změnit zvuk oznámení...',
+      click: () => {
+        mainWindow.webContents.send('open-sound-picker');
+      },
+    },
+    {
+      label: 'Výchozí zvuk oznámení',
+      click: () => {
+        ipcMain.emit('reset-notification-sound');
       },
     },
     { type: 'separator' },
@@ -212,12 +280,7 @@ function createTray() {
       },
     },
   ]);
-  tray.setToolTip('Messenger');
   tray.setContextMenu(contextMenu);
-  tray.on('click', () => {
-    mainWindow.show();
-    mainWindow.focus();
-  });
 }
 
 function createMenu() {
@@ -235,6 +298,18 @@ function createMenu() {
           },
         },
         { type: 'separator' },
+        {
+          label: 'Ztlumit zvuky',
+          type: 'checkbox',
+          checked: isMuted,
+          accelerator: 'CmdOrCtrl+Shift+M',
+          click: (menuItem) => {
+            isMuted = menuItem.checked;
+            saveSettings();
+            updateTrayMenu();
+            if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
+          },
+        },
         {
           label: 'Změnit zvuk oznámení...',
           click: () => {
@@ -286,6 +361,11 @@ function createMenu() {
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function rebuildMenus() {
+  createMenu();
+  updateTrayMenu();
 }
 
 // Notifications - allow them

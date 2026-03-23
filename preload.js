@@ -6,8 +6,16 @@ const sendTrayBadge = (dataUrl) => ipcRenderer.send('set-tray-badge', dataUrl);
 const selectNotificationSound = () => ipcRenderer.send('select-notification-sound');
 
 
+// Mute state (synced from main process)
+let isMuted = ipcRenderer.sendSync('get-mute-state');
+
+ipcRenderer.on('mute-state-changed', (event, muted) => {
+  isMuted = muted;
+});
+
 // Play sound via main process IPC
 function playNotificationSound() {
+  if (isMuted) return;
   ipcRenderer.send('play-notification-sound');
 }
 
