@@ -44,7 +44,52 @@ function saveSettings() {
   } catch { /* ignore */ }
 }
 
-const MESSENGER_URL = 'https://www.messenger.com';
+// Meta retired the standalone messenger.com web app in favor of Facebook Messages.
+const MESSENGER_URL = 'https://www.facebook.com/messages/';
+const MESSENGER_PARTITION = 'persist:messenger';
+
+const LEGACY_MESSENGER_HOSTS = new Set(['messenger.com', 'www.messenger.com']);
+const FACEBOOK_HOSTS = new Set(['facebook.com', 'www.facebook.com']);
+const FACEBOOK_APP_PATHS = [
+  /^\/messages(?:\/|$)/,
+  /^\/login(?:\.php|\/|$)/,
+  /^\/checkpoint(?:\/|$)/,
+  /^\/recover(?:\/|$)/,
+  /^\/two_step_verification(?:\/|$)/,
+  /^\/auth_platform(?:\/|$)/,
+  /^\/privacy\/consent(?:\/|$)/,
+  /^\/cookie\/consent(?:\/|$)/,
+];
+
+function isAllowedAppUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:') return false;
+
+    const hostname = url.hostname.toLowerCase();
+    if (LEGACY_MESSENGER_HOSTS.has(hostname)) return true;
+    if (hostname === 'm.facebook.com') return true;
+
+    return FACEBOOK_HOSTS.has(hostname)
+      && FACEBOOK_APP_PATHS.some(pattern => pattern.test(url.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedPermissionUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:') return false;
+
+    const hostname = url.hostname.toLowerCase();
+    return LEGACY_MESSENGER_HOSTS.has(hostname)
+      || FACEBOOK_HOSTS.has(hostname)
+      || hostname === 'm.facebook.com';
+  } catch {
+    return false;
+  }
+}
 
 loadSettings();
 
@@ -141,7 +186,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: false,
       spellcheck: true,
-      partition: 'persist:messenger',
+      partition: MESSENGER_PARTITION,
     },
     autoHideMenuBar: true,
     backgroundColor: '#000000',
@@ -170,27 +215,25 @@ function createWindow() {
 
   // Open external links in default browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (!url.startsWith('https://www.messenger.com') && !url.startsWith('https://www.facebook.com/login')) {
+    if (!isAllowedAppUrl(url)) {
       shell.openExternal(url);
       return { action: 'deny' };
     }
     return { action: 'allow' };
   });
 
-  // Handle navigation - keep messenger/fb login, open rest externally
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    const allowed = [
-      'https://www.messenger.com',
-      'https://www.facebook.com/login',
-      'https://www.facebook.com/checkpoint',
-      'https://m.facebook.com',
-    ];
-    const isAllowed = allowed.some(prefix => url.startsWith(prefix));
-    if (!isAllowed) {
+  // Keep Messenger and Facebook auth inside the app, open everything else externally.
+  const handleNavigation = (event, url) => {
+    if (event.isMainFrame === false) return;
+
+    const targetUrl = event.url || url;
+    if (!isAllowedAppUrl(targetUrl)) {
       event.preventDefault();
-      shell.openExternal(url);
+      shell.openExternal(targetUrl);
     }
-  });
+  };
+  mainWindow.webContents.on('will-navigate', handleNavigation);
+  mainWindow.webContents.on('will-redirect', handleNavigation);
 
   // Minimize to tray instead of closing (only if tray exists)
   mainWindow.on('close', (event) => {
@@ -370,9 +413,34 @@ function rebuildMenus() {
 
 // Notifications - allow them
 app.on('ready', () => {
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    const allowed = ['notifications', 'media', 'mediaKeySystem', 'clipboard-read', 'clipboard-sanitized-write'];
-    callback(allowed.includes(permission));
+  const messengerSession = session.fromPartition(MESSENGER_PARTITION);
+  const allowedPermissions = new Set([
+    'notifications',
+    'media',
+    'mediaKeySystem',
+    'clipboard-read',
+    'clipboard-sanitized-write',
+  ]);
+  const canGrantPermission = (permission, requestingUrl, isMainFrame) => (
+    isMainFrame
+    && allowedPermissions.has(permission)
+    && isTrustedPermissionUrl(requestingUrl)
+  );
+
+  messengerSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
+    const requestingUrl = details.requestingUrl
+      || details.securityOrigin
+      || requestingOrigin
+      || webContents?.getURL()
+      || '';
+    return canGrantPermission(permission, requestingUrl, details.isMainFrame);
+  });
+
+  messengerSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requestingUrl = details.requestingUrl
+      || details.securityOrigin
+      || webContents.getURL();
+    callback(canGrantPermission(permission, requestingUrl, details.isMainFrame));
   });
 });
 
