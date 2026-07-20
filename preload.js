@@ -5,6 +5,7 @@ const { ipcRenderer } = require('electron');
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
 const TITLE_BASELINE_CAPTURE_MS = 1500;
+const TITLE_REAPPEAR_NOTIFY_WINDOW_MS = 1000;
 let notificationAudio = null;
 let notificationAudioVersion = 0;
 let playScheduled = false;
@@ -58,6 +59,8 @@ ipcRenderer.on('stop-notification-sound', stopNotificationSound);
 ipcRenderer.on('notification-sound-updated', reloadNotificationAudio);
 
 let latestTitleHint = { available: false, count: 0 };
+let lastAvailableTitleCount = null;
+let titleUnavailableAt = -Infinity;
 let titleBaselineReady = false;
 let titleBaselineTimer = null;
 let notificationBaselineReady = false;
@@ -81,12 +84,24 @@ ipcRenderer.on('title-unread-hint', (_event, rawHint) => {
     ? rawHint.count
     : 0;
   const nextHint = { available, count };
-  const previousCount = latestTitleHint.available ? latestTitleHint.count : 0;
+  const now = performance.now();
+  const returningFromBriefGap = !latestTitleHint.available
+    && lastAvailableTitleCount !== null
+    && now - titleUnavailableAt <= TITLE_REAPPEAR_NOTIFY_WINDOW_MS;
+  const previousCount = latestTitleHint.available
+    ? latestTitleHint.count
+    : lastAvailableTitleCount;
   const notify = titleBaselineReady
     && available
+    && (latestTitleHint.available || returningFromBriefGap)
     && count > previousCount;
 
+  if (!available && latestTitleHint.available) titleUnavailableAt = now;
   latestTitleHint = nextHint;
+  if (available) {
+    lastAvailableTitleCount = count;
+    titleUnavailableAt = -Infinity;
+  }
   if (!titleBaselineReady && titleBaselineTimer === null) {
     startNotificationBaselineCapture();
     // Capture startup hydration in one window anchored to the first value. Do
@@ -641,17 +656,14 @@ window.addEventListener('DOMContentLoaded', () => {
 
     if (parts.length === 0) {
       const linkLabel = link.getAttribute('aria-label');
-      const text = normalizeText(linkLabel || link.innerText || link.textContent);
+      const text = normalizeText(linkLabel || link.textContent);
       if (text) parts.push(text);
     }
     return parts.join('\u001f').slice(0, 1024);
   }
 
-  function markCompactRow(link) {
-    link.querySelectorAll('[dir="auto"]').forEach((node) => {
-      if (!node.querySelector('img, svg')) node.setAttribute('data-messenger-app-compact-text', '');
-    });
-  }
+  const compactTextNodes = (link) => Array.from(link.querySelectorAll('[dir="auto"]'))
+    .filter((node) => !node.querySelector('img, svg'));
 
   function setupUnreadTracker(nav, onSnapshot) {
     const threadState = new Map();
@@ -678,8 +690,34 @@ window.addEventListener('DOMContentLoaded', () => {
     const touchState = (id, value) => {
       threadState.delete(id);
       threadState.set(id, value);
+    };
+
+    const trimState = () => {
       while (threadState.size > MAX_TRACKED_THREADS) {
-        const evictedId = threadState.keys().next().value;
+        let evictedId = null;
+        for (const candidate of threadState.keys()) {
+          if (!dirtyIds.has(candidate) && !pendingNotifications.has(candidate)) {
+            evictedId = candidate;
+            break;
+          }
+        }
+        if (evictedId === null) {
+          for (const candidate of threadState.keys()) {
+            if (!pendingNotifications.has(candidate)) {
+              evictedId = candidate;
+              break;
+            }
+          }
+        }
+        if (evictedId === null) {
+          for (const candidate of threadState.keys()) {
+            if (!dirtyIds.has(candidate)) {
+              evictedId = candidate;
+              break;
+            }
+          }
+        }
+        if (evictedId === null) evictedId = threadState.keys().next().value;
         const pending = pendingNotifications.get(evictedId);
         if (pending) clearTimeout(pending.timer);
         pendingNotifications.delete(evictedId);
@@ -695,13 +733,13 @@ window.addEventListener('DOMContentLoaded', () => {
 
     const signatureIsSubstantive = (signature) => signature.includes('\u001f');
 
-    const scheduleStableNotification = (id, signature) => {
+    const scheduleStableNotification = (id, signature, crossSourceExempt = false) => {
       cancelPendingNotification(id);
       const timer = setTimeout(() => {
         pendingNotifications.delete(id);
         const current = threadState.get(id);
         if (!current?.unread || current.signature !== signature) return;
-        onSnapshot({ count: currentCount(), notify: true });
+        onSnapshot({ count: currentCount(), notify: true, crossSourceExempt });
       }, SIGNATURE_STABILITY_MS);
       pendingNotifications.set(id, { signature, timer });
     };
@@ -759,25 +797,40 @@ window.addEventListener('DOMContentLoaded', () => {
         groups.get(id).push(link);
       });
 
+      const measuredGroups = new Map();
       for (const id of dirtyIds) {
         const allLinks = groups.get(id);
         if (!allLinks?.length) {
           cancelPendingNotification(id);
           continue;
         }
-        const visibleLinks = allLinks.filter(isElementVisible);
-        const links = visibleLinks.length > 0 ? visibleLinks : allLinks;
-        const unreadLinks = links.filter(rowHasUnread);
-        allLinks.forEach((link) => {
-          const unread = rowHasUnread(link);
-          link.toggleAttribute('data-messenger-app-unread', unread);
-          markCompactRow(link);
-        });
-
+        // Finish all style/layout reads before writing our row markers. A
+        // single Messenger commit can dirty many rows, and interleaving these
+        // phases would otherwise trigger repeated synchronous layout work.
+        const measuredLinks = allLinks.map((link) => ({
+          compactNodes: compactTextNodes(link),
+          link,
+          unread: rowHasUnread(link),
+          visible: isElementVisible(link),
+        }));
+        const visibleLinks = measuredLinks.filter((entry) => entry.visible);
+        const links = visibleLinks.length > 0 ? visibleLinks : measuredLinks;
+        const unreadLinks = links.filter((entry) => entry.unread).map((entry) => entry.link);
         const unread = unreadLinks.length > 0;
         const signature = unread
           ? [...new Set(unreadLinks.map(rowSignature).filter(Boolean))].sort().join('\u001e').slice(0, 2048)
           : '';
+        measuredGroups.set(id, { measuredLinks, signature, unread });
+      }
+
+      measuredGroups.forEach(({ measuredLinks }) => {
+        measuredLinks.forEach(({ compactNodes, link, unread }) => {
+          link.toggleAttribute('data-messenger-app-unread', unread);
+          compactNodes.forEach((node) => node.setAttribute('data-messenger-app-compact-text', ''));
+        });
+      });
+
+      for (const [id, { signature, unread }] of measuredGroups) {
         const previous = threadState.get(id);
         const notificationEligible = notificationEligibleIds.has(id);
         const substantiveSignature = unread && signatureIsSubstantive(signature);
@@ -808,7 +861,7 @@ window.addEventListener('DOMContentLoaded', () => {
                 cancelPendingNotification(id);
               }
             } else if (changedSignature && notificationEligible && substantiveSignature) {
-              scheduleStableNotification(id, signature);
+              scheduleStableNotification(id, signature, true);
             } else if (changedSignature && !substantiveSignature) {
               // Ignore temporary name-only/empty hydration states and wait for
               // the final preview before deciding.
@@ -824,6 +877,7 @@ window.addEventListener('DOMContentLoaded', () => {
           pendingUnreadTransition,
         });
       }
+      trimState();
       dirtyIds.clear();
       notificationEligibleIds.clear();
 
@@ -1259,13 +1313,14 @@ window.addEventListener('DOMContentLoaded', () => {
     return lastBadgeDataUrl;
   }
 
-  function publishCanonicalState(notify = false, source = 'structure') {
+  function publishCanonicalState(notify = false, source = 'structure', crossSourceExempt = false) {
     const count = latestTitleHint.available
       ? latestTitleHint.count
       : (domSnapshot?.count || 0);
     const now = performance.now();
     if (notify && !notificationBaselineReady) notify = false;
     if (notify
+      && !crossSourceExempt
       && lastNotifySource
       && lastNotifySource !== source
       && now - lastNotifyAt < CROSS_SOURCE_NOTIFY_WINDOW_MS) {
@@ -1276,7 +1331,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
     ipcRenderer.send('publish-unread-state', { count, notify, badgeDataUrl });
     lastPublishedCount = count;
-    if (notify) {
+    if (notify && !crossSourceExempt) {
       lastNotifyAt = now;
       lastNotifySource = source;
     }
@@ -1315,7 +1370,7 @@ window.addEventListener('DOMContentLoaded', () => {
     unreadTracker = setupUnreadTracker(nav, (snapshot) => {
       startNotificationBaselineCapture();
       domSnapshot = snapshot;
-      publishCanonicalState(snapshot.notify, 'dom');
+      publishCanonicalState(snapshot.notify, 'dom', snapshot.crossSourceExempt === true);
     });
   };
 
@@ -1353,24 +1408,28 @@ window.addEventListener('DOMContentLoaded', () => {
     navControls?.refresh();
   }
 
+  const isDirectStructuralCandidate = (node) => {
+    if (node?.nodeType !== Node.ELEMENT_NODE) return false;
+    if (node.matches('[role="main"], [role="banner"], ' + EDITOR_SELECTOR)) return true;
+    const label = normalizeText(node.getAttribute('aria-label'));
+    if (NAV_LABELS.has(label)) return true;
+    return node.matches('[role="navigation"]')
+      && (label === 'facebook' || Boolean(node.querySelector(THREAD_LINK_SELECTOR)));
+  };
+
   const nodeContainsStructuralCandidate = (node) => {
     if (node?.nodeType !== Node.ELEMENT_NODE) return false;
-      if (node.matches('[role="main"], [role="navigation"], [role="banner"], [aria-label], ' + EDITOR_SELECTOR)) {
-      const label = normalizeText(node.getAttribute('aria-label'));
-      if (node.matches('[role="main"], [role="banner"], ' + EDITOR_SELECTOR)
-        || NAV_LABELS.has(label)
-        || node.matches('[role="navigation"]') && label === 'facebook'
-        || node.matches('[role="navigation"]') && node.querySelector(THREAD_LINK_SELECTOR)) {
-        return true;
-      }
-    }
-    return Boolean(node.querySelector('[role="main"], [role="banner"], ' + EDITOR_SELECTOR))
-      || Array.from(node.querySelectorAll('[aria-label], [role="navigation"]')).some((candidate) => (
-        NAV_LABELS.has(normalizeText(candidate.getAttribute('aria-label')))
-        || candidate.matches('[role="navigation"]')
-          && normalizeText(candidate.getAttribute('aria-label')) === 'facebook'
-        || candidate.matches('[role="navigation"]') && candidate.querySelector(THREAD_LINK_SELECTOR)
-      ));
+    if (isDirectStructuralCandidate(node)) return true;
+    const candidates = node.querySelectorAll(
+      '[role="main"], [role="banner"], [role="navigation"], ' + EDITOR_SELECTOR,
+    );
+    if (Array.from(candidates).some(isDirectStructuralCandidate)) return true;
+    // Once mounted, ordinary message mutations are the hot path. A labelled
+    // replacement list will still be caught when the old nav disconnects; the
+    // broad aria-label scan is only needed while discovering the first nav.
+    return !activeNav && Array.from(node.querySelectorAll('[aria-label]')).some((candidate) => (
+      NAV_LABELS.has(normalizeText(candidate.getAttribute('aria-label')))
+    ));
   };
 
   const isManagedStructureAttributeExpected = (node, attribute) => {

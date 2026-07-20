@@ -338,6 +338,8 @@ async function run() {
 
     // Let the one-shot startup gate expire, then complete a skeleton row. Its
     // first stable preview is still baseline hydration and must remain silent.
+    win.webContents.send('title-unread-hint', { available: true, count: 0 });
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(1550);
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Hello'`);
@@ -372,6 +374,31 @@ async function run() {
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Another hello'`);
     await waitFor(() => publishedStates.some((state) => state.count === 1 && state.notify), 'already-unread message signature change missing');
+
+    // A title count increase and a different message in an already-unread DOM
+    // row can legitimately arrive inside the cross-source dedup window. The
+    // latter must not be mistaken for a duplicate of the title event.
+    await delay(1050);
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: true, count: 1 });
+    await delay(50);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'first title value after an unavailable gap notified');
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: true, count: 2 });
+    await waitFor(() => publishedStates.some((state) => state.count === 2 && state.notify), 'title notification setup missing');
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
+    await waitFor(
+      () => publishedStates.filter((state) => state.count === 2 && state.notify).length === 2,
+      'distinct DOM message was swallowed by cross-source dedup',
+    );
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: true, count: 3 });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 3 && state.notify),
+      'cross-source-exempt DOM message suppressed a following title event',
+    );
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(50);
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#status-a').textContent = 'Před 2 min'`);
@@ -545,21 +572,31 @@ async function run() {
     await delay(150);
     assert.equal(publishedStates.length, 0, 'inactive nav kept publishing mutations');
 
-    win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    win.webContents.send('title-unread-hint', { available: true, count: 7 });
-    await waitFor(() => publishedStates.some((state) => state.count === 7), 'title fallback baseline missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 7).notify, false);
+    win.webContents.send('title-unread-hint', { available: true, count: 1 });
+    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title fallback baseline missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
 
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await waitFor(() => publishedStates.some((state) => state.count === 0), 'title zero transition missing');
     assert.equal(publishedStates.findLast((state) => state.count === 0).notify, false);
 
-    await delay(1550);
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
-    await waitFor(() => publishedStates.some((state) => state.count === 1), 'post-baseline title update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, true);
+    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title availability recovery missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
+
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: true, count: 2 });
+    await waitFor(() => publishedStates.some((state) => state.count === 2), 'post-baseline title update missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, true);
+
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(20);
+    win.webContents.send('title-unread-hint', { available: true, count: 3 });
+    await waitFor(() => publishedStates.some((state) => state.count === 3), 'brief title flap lost a real count increase');
+    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, true);
 
     await win.webContents.executeJavaScript(`
       document.querySelector('#live-nav')?.remove();
@@ -574,6 +611,7 @@ async function run() {
     ), 'old nav did not unmount');
     await win.webContents.executeJavaScript(`
       const link = document.createElement('a');
+      link.id = 'late-row';
       link.className = 'thread';
       link.href = 'https://www.facebook.com/messages/t/late';
       link.innerHTML = '<img alt=""><span dir="auto">Late</span><span dir="auto">Mounted</span><button aria-label="Mark as unread"></button>';
@@ -584,7 +622,49 @@ async function run() {
       && document.querySelectorAll('[data-messenger-app-resize-handle]').length === 1
     `), 'empty fallback nav was not discovered after its first thread link arrived');
 
-    console.log('DOM smoke passed: layout recovery, remounts, viewport clamp, background-safe unread transitions, virtualization, and title fallback.');
+    // Keep the title source out of this tracker-only boundary test.
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await waitFor(() => publishedStates.some((state) => state.count === 0), 'late nav DOM fallback missing');
+    await win.webContents.executeJavaScript(`(() => {
+      const nav = document.querySelector('#late-nav');
+      const fragment = document.createDocumentFragment();
+      for (let index = 1; index <= 499; index += 1) {
+        const row = document.createElement('a');
+        row.id = 'lru-row-' + index;
+        row.className = 'thread';
+        row.href = 'https://www.facebook.com/messages/t/lru-' + index;
+        row.innerHTML = '<img alt=""><span dir="auto">LRU ' + index + '</span><span dir="auto">Read baseline</span><button aria-label="Mark as unread"></button>';
+        fragment.appendChild(row);
+      }
+      nav.appendChild(fragment);
+    })()`);
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `Boolean(document.querySelector('#lru-row-499 [data-messenger-app-compact-text]'))`,
+    ), '500-thread LRU baseline did not settle', 8000);
+
+    await delay(1050);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const nav = document.querySelector('#late-nav');
+      const overflowRow = document.createElement('a');
+      overflowRow.id = 'lru-overflow';
+      overflowRow.className = 'thread';
+      overflowRow.href = 'https://www.facebook.com/messages/t/lru-overflow';
+      overflowRow.innerHTML = '<img alt=""><span dir="auto">Overflow</span><span dir="auto">Read baseline</span><button aria-label="Mark as unread"></button>';
+      nav.appendChild(overflowRow);
+
+      const oldest = document.querySelector('#late-row');
+      oldest.setAttribute('data-unread', 'true');
+      oldest.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      oldest.querySelectorAll('[dir="auto"]')[1].textContent = 'Oldest became unread';
+    })()`);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 1 && state.notify),
+      'mid-batch LRU eviction dropped the oldest read-to-unread notification',
+      8000,
+    );
+
+    console.log('DOM smoke passed: layout recovery, remounts, viewport clamp, cross-source notifications, LRU boundaries, virtualization, and title fallback.');
   } finally {
     if (!win.isDestroyed()) win.destroy();
   }

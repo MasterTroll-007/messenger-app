@@ -10,9 +10,12 @@ const {
   isAllowedContentUrl,
   isAllowedPermissionRequest,
   isExpectedNavigationAbort,
+  isOwnedTemporaryFileName,
   isSafeExternalUrl,
+  normalizeRequestedMediaTypes,
   parseUnreadCountFromTitle,
   permitUnloadForApplicationQuit,
+  shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   validateUnreadStatePayload,
 } = require('../lib/main-policy');
@@ -54,6 +57,7 @@ test('external URL policy allows only safe schemes and never reclassifies app UR
   assert.equal(isSafeExternalUrl('http://example.com'), false);
   assert.equal(isSafeExternalUrl('file:///C:/secret.txt'), false);
   assert.equal(classifyNavigationUrl('https://www.facebook.com/messages/'), 'internal');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/marketplace/'), 'external');
   assert.equal(classifyNavigationUrl('https://example.com/'), 'external');
   assert.equal(classifyNavigationUrl('data:text/html,hello'), 'blocked');
 });
@@ -67,9 +71,13 @@ test('permission policy is main-frame, route, and permission specific', () => {
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'notifications' }), true);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'clipboard-sanitized-write' }), true);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'clipboard-read' }), false);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'mediaKeySystem' }), false);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media' }), true);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media', mediaTypes: ['audio'] }), true);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media', mediaTypes: ['video'] }), true);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media', mediaTypes: ['audio', 'video'] }), true);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media', mediaTypes: [] }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media', mediaTypes: ['display'] }), false);
-  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'media' }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'geolocation' }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'notifications', isMainFrame: false }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'notifications', requestingUrl: 'https://www.facebook.com/profile.php' }), false);
@@ -79,6 +87,42 @@ test('permission policy is main-frame, route, and permission specific', () => {
   assert.equal(isAllowedContentUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedContentUrl('https://www.messenger.com/'), true);
   assert.equal(isAllowedContentUrl('https://www.messenger.com/login/'), false);
+});
+
+test('media type normalization permits only Electron preliminary or audio/video checks', () => {
+  assert.equal(normalizeRequestedMediaTypes({}), undefined);
+  assert.equal(normalizeRequestedMediaTypes({ mediaType: 'unknown' }), undefined);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaType: 'audio' }), ['audio']);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaType: 'video' }), ['video']);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaTypes: ['audio', 'video'] }), ['audio', 'video']);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaTypes: [] }), []);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaType: 'display' }), []);
+  assert.deepEqual(normalizeRequestedMediaTypes({ mediaTypes: ['future-capture'] }), ['future-capture']);
+});
+
+test('duplicate update availability never overwrites an active or completed download phase', () => {
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'idle' }), true);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'checking' }), true);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'available' }), true);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'available', updatePromptOpen: true }), false);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'downloading' }), false);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'downloaded' }), false);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'error' }), false);
+  assert.equal(shouldHandleUpdateAvailable({}), false);
+  assert.equal(shouldHandleUpdateAvailable({ updatePhase: 'checking', isQuitting: true }), false);
+});
+
+test('startup cleanup recognizes only this app own atomic temporary files', () => {
+  const first = '123e4567-e89b-42d3-a456-426614174000';
+  const second = '223e4567-e89b-42d3-b456-426614174001';
+  assert.equal(isOwnedTemporaryFileName(`settings.json.${first}.tmp`), true);
+  assert.equal(isOwnedTemporaryFileName(`.notification-custom-${first}.mp3.${second}.tmp`), true);
+  assert.equal(isOwnedTemporaryFileName(`.notification-custom-${first}.M4A.${second}.tmp`), true);
+  assert.equal(isOwnedTemporaryFileName('settings.json.tmp'), false);
+  assert.equal(isOwnedTemporaryFileName(`notification-custom-${first}.mp3.${second}.tmp`), false);
+  assert.equal(isOwnedTemporaryFileName(`.notification-custom-${first}.exe.${second}.tmp`), false);
+  assert.equal(isOwnedTemporaryFileName(`nested/settings.json.${first}.tmp`), false);
+  assert.equal(isOwnedTemporaryFileName('.unrelated.tmp'), false);
 });
 
 test('only an explicit Chromium navigation abort can satisfy an interrupted load', () => {

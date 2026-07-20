@@ -23,7 +23,10 @@ const {
   isAllowedAppUrl,
   isAllowedPermissionRequest,
   isExpectedNavigationAbort,
+  isOwnedTemporaryFileName,
+  normalizeRequestedMediaTypes,
   permitUnloadForApplicationQuit,
+  shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   validateUnreadStatePayload,
 } = require('./lib/main-policy');
@@ -194,6 +197,20 @@ async function removeStoredCustomSounds(exceptFile = null) {
   }));
 }
 
+async function removeOrphanedTemporaryFiles() {
+  let entries;
+  try {
+    entries = await fs.promises.readdir(userDataPath, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isFile() || !isOwnedTemporaryFileName(entry.name)) return;
+    await fs.promises.unlink(path.join(userDataPath, entry.name)).catch(() => {});
+  }));
+}
+
 function getLiveMainWindow() {
   return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
 }
@@ -203,7 +220,15 @@ function getLiveTray() {
 }
 
 function showMainWindow() {
-  const win = getLiveMainWindow();
+  let win = getLiveMainWindow();
+  if (!win && app.isReady() && !isQuitting) {
+    try {
+      win = createWindow();
+    } catch (error) {
+      console.error('Could not recreate the Messenger window:', error.message);
+      return null;
+    }
+  }
   if (!win) return null;
   if (win.isMinimized()) win.restore();
   if (!win.isVisible()) win.show();
@@ -825,6 +850,7 @@ function recoverFailedUpdateRestart(error) {
   quitFlushState = 'idle';
   settingsFlushPromise = null;
   updatePhase = 'idle';
+  showMainWindow();
   restoreNativeUpdateUi();
   console.error('Could not restart into the downloaded update:', error.message);
   return true;
@@ -840,19 +866,13 @@ function getPermissionRequestUrl(webContents, requestingOrigin, details = {}) {
     || '';
 }
 
-function getRequestedMediaTypes(details = {}) {
-  if (Array.isArray(details.mediaTypes)) return details.mediaTypes;
-  if (details.mediaType === 'audio' || details.mediaType === 'video') return [details.mediaType];
-  return undefined;
-}
-
 function configureSessionPermissions(messengerSession) {
   messengerSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details = {}) => (
     isAllowedPermissionRequest({
       permission,
       requestingUrl: getPermissionRequestUrl(webContents, requestingOrigin, details),
       isMainFrame: details.isMainFrame,
-      mediaTypes: getRequestedMediaTypes(details),
+      mediaTypes: normalizeRequestedMediaTypes(details),
     })
   ));
 
@@ -861,7 +881,7 @@ function configureSessionPermissions(messengerSession) {
       permission,
       requestingUrl: getPermissionRequestUrl(webContents, '', details),
       isMainFrame: details.isMainFrame,
-      mediaTypes: getRequestedMediaTypes(details),
+      mediaTypes: normalizeRequestedMediaTypes(details),
     });
     callback(allowed);
   });
@@ -876,7 +896,10 @@ function restoreNativeUpdateUi() {
 async function promptForAvailableUpdate(info) {
   if (updatePromptOpen || isQuitting) return;
   const win = showMainWindow();
-  if (!win) return;
+  if (!win) {
+    updatePhase = 'idle';
+    return;
+  }
 
   updatePromptOpen = true;
   try {
@@ -946,6 +969,10 @@ autoUpdater.on('update-not-available', () => {
   console.log('Updater: no update available');
 });
 autoUpdater.on('update-available', (info) => {
+  if (!shouldHandleUpdateAvailable({ isQuitting, updatePromptOpen, updatePhase })) {
+    console.log('Updater: ignoring duplicate update-available event');
+    return;
+  }
   updatePhase = 'available';
   console.log('Updater: update available:', info.version);
   void promptForAvailableUpdate(info);
@@ -1002,50 +1029,47 @@ function scheduleStartupUpdateCheck() {
   }, UPDATE_DELAY_MS);
 }
 
-loadSettings();
+if (gotLock) {
+  loadSettings();
+  void enqueueSettingsOperation(removeOrphanedTemporaryFiles);
 
-app.on('second-instance', showMainWindow);
+  app.on('second-instance', showMainWindow);
 
-app.whenReady().then(() => {
-  const messengerSession = session.fromPartition(MESSENGER_PARTITION);
-  configureSessionPermissions(messengerSession);
-  messengerSession.protocol.handle(CUSTOM_PROTOCOL, handleCustomAssetRequest);
+  app.whenReady().then(() => {
+    const messengerSession = session.fromPartition(MESSENGER_PARTITION);
+    configureSessionPermissions(messengerSession);
+    messengerSession.protocol.handle(CUSTOM_PROTOCOL, handleCustomAssetRequest);
 
-  createWindow();
-  createTray();
-  createMenu();
-  scheduleStartupUpdateCheck();
-}).catch((error) => {
-  console.error('Application startup failed:', error);
-  app.quit();
-});
-
-app.on('before-quit', (event) => {
-  // A successful quitAndInstall reaches here from its earlier setImmediate.
-  // Clearing this flag prevents our later fallback from reviving quit state.
-  restartPending = false;
-  isQuitting = true;
-  cancelStartupUpdateCheck();
-  if (quitFlushState === 'complete') return;
-
-  event.preventDefault();
-  if (quitFlushState === 'flushing') return;
-  quitFlushState = 'flushing';
-
-  void flushSettingsOperationsOnce().finally(() => {
-    quitFlushState = 'complete';
+    createWindow();
+    createTray();
+    createMenu();
+    scheduleStartupUpdateCheck();
+  }).catch((error) => {
+    console.error('Application startup failed:', error);
     app.quit();
   });
-});
 
-app.on('window-all-closed', () => {
-  app.quit();
-});
+  app.on('before-quit', (event) => {
+    // A successful quitAndInstall reaches here from its earlier setImmediate.
+    // Clearing this flag prevents our later fallback from reviving quit state.
+    restartPending = false;
+    isQuitting = true;
+    cancelStartupUpdateCheck();
+    if (quitFlushState === 'complete') return;
 
-app.on('activate', () => {
-  if (getLiveMainWindow()) {
-    showMainWindow();
-  } else if (app.isReady() && !isQuitting) {
-    createWindow();
-  }
-});
+    event.preventDefault();
+    if (quitFlushState === 'flushing') return;
+    quitFlushState = 'flushing';
+
+    void flushSettingsOperationsOnce().finally(() => {
+      quitFlushState = 'complete';
+      app.quit();
+    });
+  });
+
+  app.on('window-all-closed', () => {
+    app.quit();
+  });
+
+  app.on('activate', showMainWindow);
+}
