@@ -105,8 +105,7 @@ ipcRenderer.on('unread-count-changed', (event, rawCount) => {
 
   lastUnreadCount = count;
 
-  if (!unreadBaselineReady) {
-    if (unreadBaselineTimer !== null) clearTimeout(unreadBaselineTimer);
+  if (!unreadBaselineReady && unreadBaselineTimer === null) {
     unreadBaselineTimer = setTimeout(() => {
       unreadBaselineReady = true;
       unreadBaselineTimer = null;
