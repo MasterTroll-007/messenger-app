@@ -10,6 +10,8 @@ let notificationAudioVersion = 0;
 let lastUnreadCount = null;
 let unreadBaselineReady = false;
 let unreadBaselineTimer = null;
+let domUnreadCount = null;
+let titleUnreadCount = 0;
 
 const UNREAD_BASELINE_SETTLE_MS = 5000;
 
@@ -84,11 +86,11 @@ ipcRenderer.on('notification-sound-updated', () => {
   reloadNotificationAudio();
 });
 
-ipcRenderer.on('unread-count-changed', (event, rawCount) => {
+function applyUnreadCount(rawCount, { silent = false } = {}) {
   const count = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
   if (count === lastUnreadCount) return;
 
-  if (unreadBaselineReady && lastUnreadCount !== null && count > lastUnreadCount) {
+  if (!silent && unreadBaselineReady && lastUnreadCount !== null && count > lastUnreadCount) {
     playNotificationSound();
   }
 
@@ -111,6 +113,26 @@ ipcRenderer.on('unread-count-changed', (event, rawCount) => {
       unreadBaselineTimer = null;
     }, UNREAD_BASELINE_SETTLE_MS);
   }
+}
+
+function effectiveUnreadCount() {
+  return domUnreadCount !== null ? domUnreadCount : titleUnreadCount;
+}
+
+function setDomUnreadCount(rawCount, options) {
+  domUnreadCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
+  applyUnreadCount(effectiveUnreadCount(), options);
+}
+
+function clearDomUnreadCount() {
+  if (domUnreadCount === null) return;
+  domUnreadCount = null;
+  applyUnreadCount(effectiveUnreadCount());
+}
+
+ipcRenderer.on('unread-count-changed', (event, rawCount) => {
+  titleUnreadCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
+  if (domUnreadCount === null) applyUnreadCount(effectiveUnreadCount());
 });
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -372,23 +394,10 @@ window.addEventListener('DOMContentLoaded', () => {
     };
   }
 
-  function setupUnreadDots(nav, initiallyCompact) {
-    let isCompact = initiallyCompact;
+  function setupUnreadTracker(nav, onCountChange) {
     let frameId = null;
+    let lastReported = -1;
     const pendingLinks = new Set();
-    const observer = new MutationObserver((mutations) => {
-      if (!isCompact) return;
-
-      for (const mutation of mutations) {
-        if (mutation.type === 'attributes' && mutation.target === nav && mutation.attributeName === 'style') {
-          continue;
-        }
-
-        collectLinks(mutation.target);
-        for (const node of mutation.addedNodes) collectLinks(node, true);
-      }
-      scheduleFlush();
-    });
 
     const collectLinks = (node, includeDescendants = false) => {
       const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
@@ -403,30 +412,34 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     };
 
-    const updateLink = (link) => {
-      if (!link.isConnected) return;
-
-      let hasUnread = false;
+    const linkHasUnread = (link) => {
       for (const span of link.querySelectorAll('span[dir="auto"]')) {
         const fontWeight = Number.parseInt(getComputedStyle(span).fontWeight, 10);
-        if (fontWeight >= 600) {
-          hasUnread = true;
-          break;
-        }
+        if (fontWeight >= 600) return true;
       }
-      link.classList.toggle('has-unread', hasUnread);
+      return false;
+    };
+
+    const updateLink = (link) => {
+      if (!link.isConnected) return;
+      link.classList.toggle('has-unread', linkHasUnread(link));
+    };
+
+    const reportCount = () => {
+      const count = nav.querySelectorAll(
+        'a[href*="/messages/t/"].has-unread, a[href*="/messages/e2ee/t/"].has-unread',
+      ).length;
+      if (count === lastReported) return;
+      lastReported = count;
+      onCountChange(count);
     };
 
     const flush = () => {
       frameId = null;
-      if (!isCompact) {
-        pendingLinks.clear();
-        return;
-      }
-
       const links = Array.from(pendingLinks);
       pendingLinks.clear();
       links.forEach(updateLink);
+      reportCount();
     };
 
     const scheduleFlush = () => {
@@ -435,42 +448,41 @@ window.addEventListener('DOMContentLoaded', () => {
       }
     };
 
-    const start = () => {
-      observer.observe(nav, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'aria-label'],
-        childList: true,
-        characterData: true,
-        subtree: true,
-      });
-      nav.querySelectorAll('a').forEach((link) => pendingLinks.add(link));
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes' && mutation.target === nav && mutation.attributeName === 'style') {
+          continue;
+        }
+
+        collectLinks(mutation.target);
+        for (const node of mutation.addedNodes) collectLinks(node, true);
+      }
       scheduleFlush();
-    };
+    });
 
-    const stop = () => {
-      observer.disconnect();
-      if (frameId !== null) cancelAnimationFrame(frameId);
-      frameId = null;
-      pendingLinks.clear();
-      nav.querySelectorAll('.has-unread').forEach((link) => link.classList.remove('has-unread'));
-    };
+    observer.observe(nav, {
+      attributes: true,
+      attributeFilter: ['class', 'style', 'aria-label'],
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
 
-    if (isCompact) start();
+    nav.querySelectorAll('a').forEach((link) => pendingLinks.add(link));
+    flush();
 
     return {
-      setCompact(compact) {
-        if (compact === isCompact) return;
-        isCompact = compact;
-        if (isCompact) start();
-        else stop();
-      },
       cleanup() {
-        stop();
+        observer.disconnect();
+        if (frameId !== null) cancelAnimationFrame(frameId);
+        frameId = null;
+        pendingLinks.clear();
+        nav.querySelectorAll('.has-unread').forEach((link) => link.classList.remove('has-unread'));
       },
     };
   }
 
-  function setupNavResize(nav, saved, onCompactChange) {
+  function setupNavResize(nav, saved) {
     nav.setAttribute('data-messenger-app-nav', '');
 
     let isCompact = !!saved.isCompact;
@@ -597,7 +609,6 @@ window.addEventListener('DOMContentLoaded', () => {
       isCompact = compact;
       saveState({ isCompact });
       applyCurrentMode();
-      onCompactChange(isCompact);
       scheduleHandlePosition();
     };
 
@@ -670,8 +681,12 @@ window.addEventListener('DOMContentLoaded', () => {
     activeNav = nav;
     const saved = loadState();
     const cleanupFullHeightLayout = setupFullHeightLayout(nav);
-    const unreadDots = setupUnreadDots(nav, !!saved.isCompact);
-    const resize = setupNavResize(nav, saved, (compact) => unreadDots.setCompact(compact));
+    let domBaselineAdopted = false;
+    const unreadTracker = setupUnreadTracker(nav, (count) => {
+      setDomUnreadCount(count, { silent: !domBaselineAdopted });
+      domBaselineAdopted = true;
+    });
+    const resize = setupNavResize(nav, saved);
     const cleanupMenuToggle = setupMenuToggle(saved, resize.refreshHandlePosition);
 
     const replacementObservers = [];
@@ -695,9 +710,10 @@ window.addEventListener('DOMContentLoaded', () => {
     cleanupActiveNav = () => {
       replacementObservers.forEach((observer) => observer.disconnect());
       cleanupFullHeightLayout();
-      unreadDots.cleanup();
+      unreadTracker.cleanup();
       resize.cleanup();
       cleanupMenuToggle();
+      clearDomUnreadCount();
     };
   };
 
