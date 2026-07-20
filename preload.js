@@ -86,26 +86,26 @@ ipcRenderer.on('notification-sound-updated', () => {
   reloadNotificationAudio();
 });
 
-function applyUnreadCount(rawCount, { silent = false } = {}) {
+function applyUnreadCount(rawCount, { silent = false, hasNewUnread = false } = {}) {
   const count = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
-  if (count === lastUnreadCount) return;
 
-  if (!silent && unreadBaselineReady && lastUnreadCount !== null && count > lastUnreadCount) {
+  if (!silent && unreadBaselineReady && hasNewUnread) {
     playNotificationSound();
   }
 
-  if (count > 0) {
-    const badge = createBadgeDataUrl(count);
-    if (badge) {
-      sendBadge(badge);
-      sendTrayBadge(badge);
+  if (count !== lastUnreadCount) {
+    if (count > 0) {
+      const badge = createBadgeDataUrl(count);
+      if (badge) {
+        sendBadge(badge);
+        sendTrayBadge(badge);
+      }
+    } else {
+      sendBadge(null);
+      sendTrayBadge(null);
     }
-  } else {
-    sendBadge(null);
-    sendTrayBadge(null);
+    lastUnreadCount = count;
   }
-
-  lastUnreadCount = count;
 
   if (!unreadBaselineReady && unreadBaselineTimer === null) {
     unreadBaselineTimer = setTimeout(() => {
@@ -388,10 +388,18 @@ window.addEventListener('DOMContentLoaded', () => {
     };
   }
 
-  function setupUnreadTracker(nav, onCountChange) {
+  function setupUnreadTracker(nav, onUpdate) {
     let frameId = null;
     let lastReported = -1;
     const pendingLinks = new Set();
+    const threadState = new Map();
+
+    const threadIdentity = (link) => {
+      const href = link.getAttribute('href');
+      if (!href) return null;
+      const match = href.match(/\/messages\/(?:e2ee\/)?t\/[^/?#]+/);
+      return match ? match[0] : null;
+    };
 
     const collectLinks = (node, includeDescendants = false) => {
       const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
@@ -419,13 +427,13 @@ window.addEventListener('DOMContentLoaded', () => {
       link.classList.toggle('has-unread', linkHasUnread(link));
     };
 
-    const reportCount = () => {
+    const reportCount = (hasNewUnread) => {
       const count = nav.querySelectorAll(
         'a[href*="/messages/t/"].has-unread, a[href*="/messages/e2ee/t/"].has-unread',
       ).length;
-      if (count === lastReported) return;
+      if (count === lastReported && !hasNewUnread) return;
       lastReported = count;
-      onCountChange(count);
+      onUpdate(count, hasNewUnread);
     };
 
     const flush = () => {
@@ -433,7 +441,23 @@ window.addEventListener('DOMContentLoaded', () => {
       const links = Array.from(pendingLinks);
       pendingLinks.clear();
       links.forEach(updateLink);
-      reportCount();
+
+      let hasNewUnread = false;
+      for (const link of links) {
+        if (!link.isConnected) continue;
+        const id = threadIdentity(link);
+        if (!id) continue;
+        const isUnread = link.classList.contains('has-unread');
+        const prev = threadState.get(id);
+        if (prev === undefined) {
+          threadState.set(id, isUnread);
+        } else if (prev !== isUnread) {
+          threadState.set(id, isUnread);
+          if (isUnread) hasNewUnread = true;
+        }
+      }
+
+      reportCount(hasNewUnread);
     };
 
     const scheduleFlush = () => {
@@ -676,8 +700,8 @@ window.addEventListener('DOMContentLoaded', () => {
     const saved = loadState();
     const cleanupFullHeightLayout = setupFullHeightLayout(nav);
     let domBaselineAdopted = false;
-    const unreadTracker = setupUnreadTracker(nav, (count) => {
-      setDomUnreadCount(count, { silent: !domBaselineAdopted });
+    const unreadTracker = setupUnreadTracker(nav, (count, hasNewUnread) => {
+      setDomUnreadCount(count, { silent: !domBaselineAdopted, hasNewUnread });
       domBaselineAdopted = true;
     });
     const resize = setupNavResize(nav, saved);
