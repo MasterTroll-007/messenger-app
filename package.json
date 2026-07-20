@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --check main.js && node --check preload.js",
     "build": "electron-builder --win"
   },
   "keywords": [
