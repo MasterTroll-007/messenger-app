@@ -20,8 +20,13 @@ protocol.registerSchemesAsPrivileged([
 
 let mainWindow;
 let tray;
+let trayBaseIcon;
 let isQuitting = false;
 let isMuted = false;
+let customSoundFile = null;
+let isSelectingSound = false;
+
+const CUSTOM_SOUND_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a'];
 
 // Settings persistence
 const settingsPath = path.join(userDataPath, 'settings.json');
@@ -31,6 +36,13 @@ function loadSettings() {
     if (fs.existsSync(settingsPath)) {
       const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
       isMuted = !!data.muted;
+      if (
+        typeof data.customSoundFile === 'string'
+        && path.basename(data.customSoundFile) === data.customSoundFile
+        && /^notification-custom\.(mp3|wav|ogg|m4a)$/i.test(data.customSoundFile)
+      ) {
+        customSoundFile = data.customSoundFile;
+      }
     }
   } catch { /* ignore */ }
 }
@@ -40,8 +52,21 @@ function saveSettings() {
     let data = {};
     try { data = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { /* ignore */ }
     data.muted = isMuted;
+    data.customSoundFile = customSoundFile;
     fs.writeFileSync(settingsPath, JSON.stringify(data));
   } catch { /* ignore */ }
+}
+
+function removeCustomSoundFiles(exceptFile = null) {
+  for (const extension of CUSTOM_SOUND_EXTENSIONS) {
+    const fileName = `notification-custom${extension}`;
+    if (fileName === exceptFile) continue;
+
+    const soundPath = path.join(userDataPath, fileName);
+    try {
+      if (fs.existsSync(soundPath)) fs.unlinkSync(soundPath);
+    } catch { /* ignore */ }
+  }
 }
 
 // Meta retired the standalone messenger.com web app in favor of Facebook Messages.
@@ -95,35 +120,92 @@ loadSettings();
 
 // IPC handler for custom notification sound selection
 ipcMain.on('select-notification-sound', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Vyber zvuk oznámení',
-    filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
-    properties: ['openFile'],
-  });
-  if (!result.canceled && result.filePaths[0]) {
-    const dest = path.join(userDataPath, 'notification-custom.mp3');
-    fs.copyFileSync(result.filePaths[0], dest);
-    mainWindow.webContents.send('notification-sound-updated', dest);
+  if (isSelectingSound) return;
+  isSelectingSound = true;
+
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Vyber zvuk oznámení',
+      filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
+      properties: ['openFile'],
+    });
+    if (!result.canceled && result.filePaths[0]) {
+      const source = result.filePaths[0];
+      const extension = path.extname(source).toLowerCase();
+      if (!CUSTOM_SOUND_EXTENSIONS.includes(extension)) return;
+
+      const nextFile = `notification-custom${extension}`;
+      const destination = path.join(userDataPath, nextFile);
+      const temporary = path.join(userDataPath, 'notification-custom.tmp');
+      const backup = path.join(userDataPath, 'notification-custom.backup');
+
+      try {
+        await fs.promises.copyFile(source, temporary);
+        if (fs.existsSync(backup)) await fs.promises.unlink(backup);
+        if (fs.existsSync(destination)) await fs.promises.rename(destination, backup);
+
+        try {
+          await fs.promises.rename(temporary, destination);
+        } catch (error) {
+          if (fs.existsSync(backup)) await fs.promises.rename(backup, destination);
+          throw error;
+        }
+
+        try {
+          if (fs.existsSync(backup)) await fs.promises.unlink(backup);
+        } catch { /* stale backup is harmless */ }
+        removeCustomSoundFiles(nextFile);
+        customSoundFile = nextFile;
+        saveSettings();
+        mainWindow.webContents.send('notification-sound-updated');
+      } catch (error) {
+        try {
+          if (fs.existsSync(temporary)) await fs.promises.unlink(temporary);
+        } catch { /* ignore */ }
+        dialog.showErrorBox('Chyba zvuku', 'Vybraný zvuk se nepodařilo uložit.');
+      }
+    }
+  } finally {
+    isSelectingSound = false;
   }
 });
 
 ipcMain.on('reset-notification-sound', () => {
-  const custom = path.join(userDataPath, 'notification-custom.mp3');
-  if (fs.existsSync(custom)) fs.unlinkSync(custom);
-  mainWindow.webContents.send('notification-sound-updated', null);
+  removeCustomSoundFiles();
+  customSoundFile = null;
+  saveSettings();
+  mainWindow.webContents.send('notification-sound-updated');
 });
 
 // Notification sound
 
 function getNotificationSoundPath() {
-  const custom = path.join(userDataPath, 'notification-custom.mp3');
-  if (fs.existsSync(custom)) return custom;
+  if (customSoundFile) {
+    const configured = path.join(userDataPath, customSoundFile);
+    if (fs.existsSync(configured)) return configured;
+  }
+
+  // Backwards compatibility with custom sounds saved by older versions.
+  for (const extension of CUSTOM_SOUND_EXTENSIONS) {
+    const custom = path.join(userDataPath, `notification-custom${extension}`);
+    if (fs.existsSync(custom)) return custom;
+  }
+
   // Check extraResources first (real file, not inside asar)
   const prod = path.join(process.resourcesPath, 'notification.mp3');
   if (fs.existsSync(prod) && !prod.includes('app.asar')) return prod;
   // Dev mode fallback
   const dev = path.join(__dirname, 'assets', 'notification.mp3');
   return dev;
+}
+
+function getNotificationSoundContentType(soundPath) {
+  switch (path.extname(soundPath).toLowerCase()) {
+    case '.wav': return 'audio/wav';
+    case '.ogg': return 'audio/ogg';
+    case '.m4a': return 'audio/mp4';
+    default: return 'audio/mpeg';
+  }
 }
 
 // Protocol handler is registered in app.whenReady below
@@ -140,15 +222,7 @@ ipcMain.on('set-mute-state', (event, muted) => {
   if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
 });
 
-ipcMain.on('play-notification-sound', () => {
-  if (isMuted) return;
-  const soundPath = getNotificationSoundPath();
-  console.log('NAV playing sound:', soundPath);
-  const { exec } = require('child_process');
-  exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName presentationCore; $p = New-Object system.windows.media.mediaplayer; $p.open([uri]'${soundPath.replace(/'/g, "''")}'); Start-Sleep -Milliseconds 300; $p.Play(); Start-Sleep -Seconds 3"`);
-});
-
-// IPC handler for badge overlay (taskbar - pulsing)
+// IPC handler for the taskbar badge.
 ipcMain.on('set-badge', (event, dataUrl) => {
   if (!mainWindow) return;
   if (dataUrl) {
@@ -159,16 +233,14 @@ ipcMain.on('set-badge', (event, dataUrl) => {
   }
 });
 
-// IPC handler for tray badge (static, no pulsing)
+// IPC handler for the tray badge.
 ipcMain.on('set-tray-badge', (event, dataUrl) => {
   if (!tray) return;
   if (dataUrl) {
     const icon = nativeImage.createFromDataURL(dataUrl).resize({ width: 16, height: 16 });
     tray.setImage(icon);
-  } else {
-    const iconPath = path.join(__dirname, 'assets', 'icon.png');
-    const originalIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-    if (!originalIcon.isEmpty()) tray.setImage(originalIcon);
+  } else if (trayBaseIcon && !trayBaseIcon.isEmpty()) {
+    tray.setImage(trayBaseIcon);
   }
 });
 
@@ -187,6 +259,7 @@ function createWindow() {
       sandbox: false,
       spellcheck: true,
       partition: MESSENGER_PARTITION,
+      autoplayPolicy: 'no-user-gesture-required',
     },
     autoHideMenuBar: true,
     backgroundColor: '#000000',
@@ -200,14 +273,6 @@ function createWindow() {
   mainWindow.webContents.setUserAgent(userAgent);
 
   mainWindow.loadURL(MESSENGER_URL);
-
-  // Forward console logs from renderer to main process
-  mainWindow.webContents.on('console-message', (e) => {
-    const message = e.message || '';
-    if (message.startsWith('NAV') || message.startsWith('  ')) {
-      console.log('[renderer]', message);
-    }
-  });
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
@@ -247,6 +312,7 @@ function createWindow() {
   mainWindow.webContents.on('page-title-updated', (event, title) => {
     const match = title.match(/\((\d+)\)/);
     const count = match ? parseInt(match[1]) : 0;
+    mainWindow.webContents.send('unread-count-changed', count);
     if (count > 0) {
       mainWindow.setTitle(`Messenger (${count})`);
       if (tray) tray.setToolTip(`Messenger - ${count} neprectenych zprav`);
@@ -265,13 +331,13 @@ function createTray() {
     return;
   }
 
-  const trayIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  if (trayIcon.isEmpty()) {
+  trayBaseIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+  if (trayBaseIcon.isEmpty()) {
     console.log('Tray icon is empty - skipping tray');
     return;
   }
 
-  tray = new Tray(trayIcon);
+  tray = new Tray(trayBaseIcon);
   updateTrayMenu();
   tray.setToolTip('Messenger');
   tray.on('click', () => {
@@ -530,10 +596,14 @@ autoUpdater.on('error', (err) => {
 
 app.whenReady().then(() => {
   // Register protocol handler for local audio files
-  protocol.handle('messenger-asset', () => {
+  const messengerSession = session.fromPartition(MESSENGER_PARTITION);
+  messengerSession.protocol.handle('messenger-asset', () => {
     const soundPath = getNotificationSoundPath();
     return new Response(fs.readFileSync(soundPath), {
-      headers: { 'Content-Type': 'audio/mpeg' }
+      headers: {
+        'Content-Type': getNotificationSoundContentType(soundPath),
+        'Cache-Control': 'no-store',
+      }
     });
   });
 
@@ -541,8 +611,14 @@ app.whenReady().then(() => {
   createTray();
   createMenu();
 
-  // Check for updates shortly after start
-  setTimeout(() => autoUpdater.checkForUpdates(), 1000);
+  // Keep the update request away from Messenger's cold-start network burst.
+  if (app.isPackaged) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        if (!isQuitting) autoUpdater.checkForUpdates();
+      }, 30000);
+    });
+  }
 });
 
 app.on('before-quit', () => {
