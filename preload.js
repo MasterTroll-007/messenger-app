@@ -120,7 +120,8 @@ window.addEventListener('DOMContentLoaded', () => {
   const MIN_CHAT_WIDTH_PX = 280;
   const MAX_NAV_WIDTH_PX = 600;
   const MAX_TRACKED_THREADS = 500;
-  const CROSS_SOURCE_NOTIFY_WINDOW_MS = 1000;
+  const CROSS_SOURCE_NOTIFY_WINDOW_MS = AUDIO_COALESCE_MS;
+  const STRUCTURE_GAP_GRACE_MS = 1000;
   const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
   const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
   const COMPACT_CONTROL_SELECTOR = [
@@ -1453,6 +1454,56 @@ window.addEventListener('DOMContentLoaded', () => {
   let unreadTracker = null;
   let navControls = null;
   let structureTimerId = null;
+  let structureGapTimer = null;
+  let structureGapDeadline = -Infinity;
+  let structureGapGeneration = 0;
+  let pendingDomSnapshot = null;
+
+  const clearStructureGap = () => {
+    structureGapGeneration += 1;
+    if (structureGapTimer !== null) clearTimeout(structureGapTimer);
+    structureGapTimer = null;
+    structureGapDeadline = -Infinity;
+    pendingDomSnapshot = null;
+  };
+
+  const beginStructureGap = () => {
+    if (structureGapTimer !== null) return;
+    const generation = structureGapGeneration + 1;
+    structureGapGeneration = generation;
+    structureGapDeadline = performance.now() + STRUCTURE_GAP_GRACE_MS;
+    pendingDomSnapshot = null;
+    structureGapTimer = setTimeout(() => {
+      if (generation !== structureGapGeneration) return;
+      structureGapTimer = null;
+      structureGapDeadline = -Infinity;
+      const pending = pendingDomSnapshot;
+      pendingDomSnapshot = null;
+
+      if (activeNav && activeMain) {
+        if (pending) {
+          domSnapshot = { ...pending, notify: false };
+          publishCanonicalState(false, 'structure');
+        }
+        return;
+      }
+
+      domSnapshot = null;
+      publishCanonicalState(false, 'structure');
+    }, STRUCTURE_GAP_GRACE_MS);
+  };
+
+  const acceptDomSnapshot = (snapshot) => {
+    const gapActive = structureGapTimer !== null
+      && performance.now() < structureGapDeadline;
+    if (gapActive && (domSnapshot?.count || 0) > 0 && snapshot.count === 0) {
+      pendingDomSnapshot = snapshot;
+      return;
+    }
+    if (structureGapTimer !== null) clearStructureGap();
+    domSnapshot = snapshot;
+    publishCanonicalState(snapshot.notify, 'dom', snapshot.crossSourceExempt === true);
+  };
 
   const unmountNav = (publishFallback = true) => {
     unreadTracker?.cleanup();
@@ -1460,8 +1511,7 @@ window.addEventListener('DOMContentLoaded', () => {
     unreadTracker = null;
     navControls = null;
     activeNav = null;
-    domSnapshot = null;
-    if (publishFallback) publishCanonicalState(false, 'structure');
+    if (publishFallback) beginStructureGap();
   };
 
   const scheduleStructure = () => {
@@ -1478,8 +1528,7 @@ window.addEventListener('DOMContentLoaded', () => {
     navControls = setupNavControls(nav, saved, scheduleStructure);
     unreadTracker = setupUnreadTracker(nav, (snapshot) => {
       startNotificationBaselineCapture();
-      domSnapshot = snapshot;
-      publishCanonicalState(snapshot.notify, 'dom', snapshot.crossSourceExempt === true);
+      acceptDomSnapshot(snapshot);
     });
   };
 
@@ -1492,21 +1541,31 @@ window.addEventListener('DOMContentLoaded', () => {
     }
 
     if (!nextNav || !nextMain) {
-      if (activeNav) unmountNav();
-      activeMain = null;
+      const preserveConnectedTracker = Boolean(activeNav?.isConnected);
+      if (activeNav && !preserveConnectedTracker) unmountNav();
+      if (!activeNav || !activeMain?.isConnected) activeMain = null;
       clearManagedLayout();
       document.documentElement.classList.remove('messenger-app-mounted');
-      document.body.classList.remove(
-        'messenger-app-compact',
-        'messenger-app-menu-hidden',
-        'messenger-app-mounted',
-      );
+      document.body.classList.remove('messenger-app-mounted');
+      if (!preserveConnectedTracker) {
+        document.body.classList.remove(
+          'messenger-app-compact',
+          'messenger-app-menu-hidden',
+        );
+      }
       clearPageConstraints();
       return;
     }
 
     if (activeNav !== nextNav) {
-      if (activeNav) unmountNav(false);
+      if (activeNav) {
+        // A replacement can already contain thread anchors while React is
+        // still hydrating their unread semantics. Any zero snapshot during a
+        // handoff from a nonzero list therefore needs the same fixed grace as
+        // a completely empty skeleton.
+        const replacementNeedsGrace = (domSnapshot?.count || 0) > 0;
+        unmountNav(!activeNav.isConnected || replacementNeedsGrace);
+      }
       mountNav(nextNav);
     }
     activeMain = nextMain;

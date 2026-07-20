@@ -5,6 +5,7 @@ const test = require('node:test');
 
 const {
   classifyNavigationUrl,
+  createUsableBadgeImage,
   getTitleUnreadHint,
   isAllowedAppUrl,
   isAllowedContentUrl,
@@ -168,6 +169,29 @@ test('unread IPC payload validation bounds count and PNG dimensions/size', () =>
   assert.equal(validateUnreadStatePayload({ count: -1, notify: false, badgeDataUrl: null }), null);
   assert.equal(validateUnreadStatePayload({ count: 10000, notify: false, badgeDataUrl: null }), null);
   assert.equal(validateUnreadStatePayload({ count: 1, notify: 1, badgeDataUrl: null }), null);
-  assert.equal(validateUnreadStatePayload({ count: 1, notify: false, badgeDataUrl: 'data:image/png;base64,bm90LXBuZw==' }), null);
-  assert.equal(validateUnreadStatePayload({ count: 1, notify: false, badgeDataUrl: pngDataUrl(65, 16) }), null);
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 1, notify: true, badgeDataUrl: 'data:image/png;base64,bm90LXBuZw==' }),
+    { count: 1, notify: true, badgeDataUrl: null },
+  );
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 1, notify: false, badgeDataUrl: pngDataUrl(65, 16) }),
+    { count: 1, notify: false, badgeDataUrl: null },
+  );
+});
+
+test('native badge decoding degrades independently from unread state', () => {
+  const validImage = {
+    getSize: () => ({ width: 48, height: 48 }),
+    isEmpty: () => false,
+  };
+  assert.equal(createUsableBadgeImage('badge', () => validImage), validImage);
+  assert.equal(createUsableBadgeImage('badge', () => { throw new Error('decode failed'); }), null);
+  assert.equal(createUsableBadgeImage('badge', () => ({
+    getSize: () => ({ width: 65, height: 48 }),
+    isEmpty: () => false,
+  })), null);
+  assert.equal(createUsableBadgeImage('badge', () => ({
+    getSize: () => ({ width: 48, height: 48 }),
+    isEmpty: () => true,
+  })), null);
 });

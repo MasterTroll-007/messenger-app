@@ -261,6 +261,126 @@ async function run() {
         && Math.abs(root.bottom - (viewport - 5)) <= 1;
     })()`), 'global body scrollbar/offset returned after Meta style reconciliation');
 
+    // A real React shell replacement can disconnect the old navigation, mount
+    // an empty skeleton in a later task, and hydrate rows after that. Preserve
+    // the last unread snapshot across the fixed handoff grace instead of
+    // publishing a transient zero.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__detachedLiveNav = document.querySelector('#live-nav');
+      window.__detachedLiveNav.remove();
+    `);
+    await delay(150);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'nav disconnect published zero before grace');
+    await win.webContents.executeJavaScript(`(() => {
+      const skeleton = document.createElement('nav');
+      skeleton.id = 'live-nav';
+      skeleton.setAttribute('role', 'navigation');
+      skeleton.setAttribute('aria-label', 'Conversation list');
+      skeleton.innerHTML = '<h1>Loading chats</h1>';
+      document.querySelector('#main').before(skeleton);
+    })()`);
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.querySelector('#live-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'empty replacement nav did not mount');
+    await delay(150);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'empty replacement skeleton published zero');
+    const skeletonHydration = await win.webContents.executeJavaScript(`(() => {
+      try {
+        const skeleton = document.querySelector('#live-nav');
+        const detached = window.__detachedLiveNav;
+        if (!skeleton || !detached) return { error: 'missing skeleton or detached nav' };
+        skeleton.replaceChildren();
+        while (detached.firstChild) skeleton.appendChild(detached.firstChild);
+        delete window.__detachedLiveNav;
+        return { ok: true };
+      } catch (error) {
+        return { error: String(error?.stack || error) };
+      }
+    })()`);
+    assert.deepEqual(skeletonHydration, { ok: true });
+    await waitFor(async () => win.webContents.executeJavaScript(`
+      document.querySelector('#row-a')?.hasAttribute('data-messenger-app-unread')
+      && document.querySelector('#app')?.hasAttribute('data-messenger-app-viewport-root')
+    `), 'replacement nav rows did not hydrate');
+    await delay(1050);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'stale shell handoff timer cleared a hydrated nav');
+    assert.equal(publishedStates.some((state) => state.notify), false, 'shell handoff generated a notification');
+
+    // Meta can keep its previous list connected but hidden while a visible
+    // replacement already has thread anchors whose unread state is not yet
+    // hydrated. This is still a handoff, so the read-looking skeleton must not
+    // erase the previous unread snapshot.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const oldNav = document.querySelector('#live-nav');
+      oldNav.id = 'connected-old-nav';
+      oldNav.setAttribute('aria-hidden', 'true');
+      const skeleton = document.createElement('nav');
+      skeleton.id = 'live-nav';
+      skeleton.setAttribute('role', 'navigation');
+      skeleton.setAttribute('aria-label', 'Conversation list');
+      skeleton.innerHTML = '<h1>Loading connected replacement</h1><a href="/messages/t/hydrating"><span dir="auto">Hydrating</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button></a>';
+      document.querySelector('#main').before(skeleton);
+      window.__connectedHandoffOld = oldNav;
+    })()`);
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.querySelector('#live-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'connected hydrating replacement nav did not mount');
+    await delay(150);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'connected hydrating replacement published zero');
+    const connectedHydration = await win.webContents.executeJavaScript(`(() => {
+      try {
+        const skeleton = document.querySelector('#live-nav');
+        const oldNav = window.__connectedHandoffOld;
+        if (!skeleton || !oldNav) return { error: 'missing connected skeleton or old nav' };
+        skeleton.replaceChildren();
+        while (oldNav.firstChild) skeleton.appendChild(oldNav.firstChild);
+        oldNav.remove();
+        delete window.__connectedHandoffOld;
+        return { ok: true };
+      } catch (error) {
+        return { error: String(error?.stack || error) };
+      }
+    })()`);
+    assert.deepEqual(connectedHydration, { ok: true });
+    await waitFor(async () => win.webContents.executeJavaScript(`
+      document.querySelector('#row-a')?.hasAttribute('data-messenger-app-unread')
+      && document.querySelector('#app')?.hasAttribute('data-messenger-app-viewport-root')
+    `), 'connected replacement nav rows did not hydrate');
+    await delay(1050);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'connected handoff timer cleared a hydrated nav');
+    assert.equal(publishedStates.some((state) => state.notify), false, 'connected shell handoff generated a notification');
+
+    // A permanently absent nav must still retire after the original deadline;
+    // unrelated structure reconciles cannot keep extending that deadline.
+    publishedStates.length = 0;
+    const permanentGapStartedAt = Date.now();
+    await win.webContents.executeJavaScript(`
+      window.__permanentGapNav = document.querySelector('#live-nav');
+      window.__permanentGapNav.remove();
+      [150, 400, 750].forEach((delayMs, index) => {
+        setTimeout(() => document.body.classList.toggle('gap-pulse-' + index), delayMs);
+      });
+    `);
+    await delay(250);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'permanent gap decremented before grace');
+    await waitFor(() => publishedStates.some((state) => state.count === 0), 'permanent nav gap never retired');
+    assert.ok(Date.now() - permanentGapStartedAt < 1600, 'structure mutations extended the original gap deadline');
+    await delay(250);
+    assert.equal(
+      publishedStates.filter((state) => state.count === 0).length,
+      1,
+      'permanent nav gap published zero more than once',
+    );
+    await win.webContents.executeJavaScript(`
+      document.body.classList.remove('gap-pulse-0', 'gap-pulse-1', 'gap-pulse-2');
+      document.querySelector('#main').before(window.__permanentGapNav);
+      delete window.__permanentGapNav;
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 1), 'restored nav baseline missing after permanent gap');
+    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
+
     await win.webContents.executeJavaScript(`
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true, cancelable: true }));
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true, cancelable: true }));
@@ -346,6 +466,61 @@ async function run() {
     await delay(300);
     assert.equal(publishedStates.length, 0, 'late startup row hydration generated a notification');
 
+    // An aria-hidden overlay can temporarily hide the connected shell for
+    // longer than the replacement grace. Keep the unread tracker alive so a
+    // message arriving behind that overlay is not converted into a baseline.
+    await win.webContents.executeJavaScript(`
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true, cancelable: true }));
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true, cancelable: true }));
+    `);
+    await waitFor(async () => win.webContents.executeJavaScript(`
+      document.body.classList.contains('messenger-app-compact')
+      && document.body.classList.contains('messenger-app-menu-hidden')
+      && getComputedStyle(document.querySelector('#replaced-search')).display === 'none'
+      && getComputedStyle(document.querySelector('#replaced-inbox')).display === 'none'
+    `), 'compact/menu modes did not reactivate before connected overlay');
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#live-nav').setAttribute('aria-hidden', 'true');
+      document.querySelector('#main').setAttribute('aria-hidden', 'true');
+    `);
+    await delay(1100);
+    assert.equal(publishedStates.some((state) => state.count === 0), false, 'connected hidden shell cleared the unread count');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Message behind overlay';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 2 && state.notify),
+      'connected hidden tracker missed a new message',
+    );
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#live-nav').removeAttribute('aria-hidden');
+      document.querySelector('#main').removeAttribute('aria-hidden');
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 1), 'hidden tracker read transition missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
+    await waitFor(async () => win.webContents.executeJavaScript(`
+      document.body.classList.contains('messenger-app-mounted')
+      && document.querySelector('#app').hasAttribute('data-messenger-app-viewport-root')
+      && document.body.classList.contains('messenger-app-compact')
+      && document.body.classList.contains('messenger-app-menu-hidden')
+      && getComputedStyle(document.querySelector('#replaced-search')).display === 'none'
+      && getComputedStyle(document.querySelector('#replaced-inbox')).display === 'none'
+    `), 'layout did not resume after connected overlay');
+    await win.webContents.executeJavaScript(`
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true, cancelable: true }));
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true, cancelable: true }));
+    `);
+    await waitFor(async () => win.webContents.executeJavaScript(`
+      !document.body.classList.contains('messenger-app-compact')
+      && !document.body.classList.contains('messenger-app-menu-hidden')
+    `), 'compact/menu state desynchronized across connected overlay');
+
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
       window.__messengerTestRequestAnimationFrame = window.requestAnimationFrame;
@@ -397,6 +572,63 @@ async function run() {
       () => publishedStates.some((state) => state.count === 3 && state.notify),
       'cross-source-exempt DOM message suppressed a following title event',
     );
+
+    // Keep cross-source suppression no wider than the audio coalescing window.
+    // Two different messages more than 300ms apart deserve separate sounds,
+    // even when title and DOM happen to report them from opposite directions.
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceRow = document.createElement('a');
+      window.__crossSourceRow.className = 'thread';
+      window.__crossSourceRow.href = 'https://www.facebook.com/messages/t/cross-source';
+      window.__crossSourceRow.innerHTML = '<img alt=""><span dir="auto">Cross source</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__crossSourceRow);
+    `);
+    await delay(350);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceRow.setAttribute('data-unread', 'true');
+      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct DOM-first message';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 3 && state.notify),
+      'title-to-DOM dedup swallowed a message outside audio coalescing',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceRow.setAttribute('data-unread', 'false');
+      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(1050);
+
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(50);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceRow.setAttribute('data-unread', 'true');
+      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct title-followed message';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 2 && state.notify),
+      'DOM notification setup for reverse cross-source order missing',
+    );
+    await delay(350);
+    win.webContents.send('title-unread-hint', { available: true, count: 4 });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 4 && state.notify),
+      'DOM-to-title dedup swallowed a message outside audio coalescing',
+    );
+    assert.equal(
+      publishedStates.filter((state) => state.notify).length,
+      2,
+      'distinct reverse-order cross-source messages did not both notify',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceRow.setAttribute('data-unread', 'false');
+      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__crossSourceRow.remove();
+      delete window.__crossSourceRow;
+    `);
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(50);
 

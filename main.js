@@ -19,6 +19,7 @@ const path = require('path');
 
 const {
   classifyNavigationUrl,
+  createUsableBadgeImage,
   getTitleUnreadHint,
   isAllowedAppUrl,
   isAllowedPermissionRequest,
@@ -220,6 +221,7 @@ function getLiveTray() {
 }
 
 function showMainWindow() {
+  if (isQuitting) return null;
   let win = getLiveMainWindow();
   if (!win && app.isReady() && !isQuitting) {
     try {
@@ -285,20 +287,9 @@ ipcMain.on('publish-unread-state', (event, rawPayload) => {
   const payload = validateUnreadStatePayload(rawPayload);
   if (!payload) return;
 
-  let nextBadgeIcon = null;
-  if (payload.badgeDataUrl) {
-    let image;
-    try {
-      image = nativeImage.createFromDataURL(payload.badgeDataUrl);
-      const size = image.getSize();
-      if (image.isEmpty() || size.width < 1 || size.height < 1 || size.width > 64 || size.height > 64) {
-        return;
-      }
-    } catch {
-      return;
-    }
-    nextBadgeIcon = image;
-  }
+  const nextBadgeIcon = payload.badgeDataUrl
+    ? createUsableBadgeImage(payload.badgeDataUrl, (dataUrl) => nativeImage.createFromDataURL(dataUrl))
+    : null;
 
   currentUnreadCount = payload.count;
   currentBadgeIcon = payload.count > 0 ? nextBadgeIcon : null;
@@ -671,7 +662,7 @@ function createWindow() {
   });
 
   win.once('ready-to-show', () => {
-    if (!win.isDestroyed()) win.show();
+    if (!isQuitting && !win.isDestroyed()) win.show();
   });
 
   win.on('close', (event) => {
