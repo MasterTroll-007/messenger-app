@@ -335,7 +335,7 @@ window.addEventListener('DOMContentLoaded', () => {
       threadFrameId = null;
       const editor = Array.from(main.querySelectorAll('[role="textbox"][contenteditable="true"]'))
         .find((node) => node.getBoundingClientRect().width > 100);
-      if (!editor) return false;
+      if (!editor) return;
 
       let threadRegion = null;
       for (let node = editor; node && node !== main.parentElement; node = node.parentElement) {
@@ -348,31 +348,39 @@ window.addEventListener('DOMContentLoaded', () => {
           threadRegion = node;
         }
       }
-      if (!threadRegion) return false;
+      if (!threadRegion) return;
 
+      const nextNodes = new Set();
       for (let node = editor; node; node = node.parentElement) {
         const rect = node.getBoundingClientRect();
         if (rect.height > window.innerHeight / 2 && getComputedStyle(node).maxHeight !== 'none') {
           node.setAttribute('data-messenger-app-thread-limit', '');
-          threadNodes.add(node);
+          nextNodes.add(node);
         }
         if (node === threadRegion) break;
       }
 
       threadRegion.setAttribute('data-messenger-app-thread-region', '');
-      threadNodes.add(threadRegion);
-      if (threadObserver) threadObserver.disconnect();
-      return true;
+      nextNodes.add(threadRegion);
+
+      threadNodes.forEach((node) => {
+        if (!nextNodes.has(node)) {
+          node.removeAttribute('data-messenger-app-thread-region');
+          node.removeAttribute('data-messenger-app-thread-limit');
+        }
+      });
+
+      threadNodes.clear();
+      nextNodes.forEach((node) => threadNodes.add(node));
     };
 
     const scheduleThreadHeight = () => {
       if (threadFrameId === null) threadFrameId = requestAnimationFrame(applyThreadHeight);
     };
 
-    if (!applyThreadHeight()) {
-      threadObserver = new MutationObserver(scheduleThreadHeight);
-      threadObserver.observe(main, { childList: true, subtree: true });
-    }
+    applyThreadHeight();
+    threadObserver = new MutationObserver(scheduleThreadHeight);
+    threadObserver.observe(main, { childList: true, subtree: true });
 
     return () => {
       if (threadObserver) threadObserver.disconnect();
