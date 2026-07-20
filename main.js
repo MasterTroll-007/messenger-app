@@ -1,179 +1,616 @@
-const { app, BrowserWindow, shell, Menu, Tray, nativeImage, session, ipcMain, dialog, protocol } = require('electron');
-const { autoUpdater } = require('electron-updater');
-const path = require('path');
-const fs = require('fs');
+'use strict';
 
-// Store user data in a fixed location (not temp) so login persists
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  protocol,
+  session,
+  shell,
+  Tray,
+} = require('electron');
+const { autoUpdater } = require('electron-updater');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const {
+  classifyNavigationUrl,
+  createUsableBadgeImage,
+  getTitleUnreadHint,
+  isAllowedAppUrl,
+  isAllowedPermissionRequest,
+  isExpectedNavigationAbort,
+  isOwnedTemporaryFileName,
+  normalizeRequestedMediaTypes,
+  permitUnloadForApplicationQuit,
+  shouldHandleUpdateAvailable,
+  soundHeaderMatchesExtension,
+  validateUnreadStatePayload,
+} = require('./lib/main-policy');
+
+const MESSENGER_URL = 'https://www.facebook.com/messages/';
+const MESSENGER_PARTITION = 'persist:messenger';
+const CUSTOM_PROTOCOL = 'messenger-asset';
+const CUSTOM_SOUND_EXTENSIONS = new Set(['.mp3', '.wav', '.ogg', '.m4a']);
+const MAX_SOUND_BYTES = 10 * 1024 * 1024;
+const SETTINGS_VERSION = 1;
+const SETTINGS_FLUSH_TIMEOUT_MS = 5_000;
+const UPDATE_DELAY_MS = 30_000;
+const LOAD_RETRY_DELAYS_MS = [750, 2_000];
+
 const userDataPath = path.join(app.getPath('appData'), 'MessengerApp');
+const settingsPath = path.join(userDataPath, 'settings.json');
+
 app.setPath('userData', userDataPath);
 
-// Prevent multiple instances
 const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-}
+if (!gotLock) app.quit();
 
-// Register custom protocol before app ready (bypasses CSP for local audio)
 protocol.registerSchemesAsPrivileged([
-  { scheme: 'messenger-asset', privileges: { bypassCSP: true, stream: true } }
+  {
+    scheme: CUSTOM_PROTOCOL,
+    privileges: {
+      bypassCSP: true,
+      secure: true,
+      standard: true,
+      stream: true,
+      supportFetchAPI: true,
+    },
+  },
 ]);
 
-let mainWindow;
-let tray;
+let mainWindow = null;
+let tray = null;
+let trayBaseIcon = null;
 let isQuitting = false;
 let isMuted = false;
+let customSoundFile = null;
+let currentUnreadCount = 0;
+let currentBadgeIcon = null;
+let lastAllowedAppUrl = MESSENGER_URL;
+let settingsOperationQueue = Promise.resolve();
+let settingsFlushPromise = null;
+let quitFlushState = 'idle';
+let restartPending = false;
+let isSelectingSound = false;
+let updateTimer = null;
+let updatePhase = 'idle';
+let updatePromptOpen = false;
+let updateErrorPromptOpen = false;
 
-// Settings persistence
-const settingsPath = path.join(userDataPath, 'settings.json');
+const LEGACY_SOUND_FILE_PATTERN = /^notification-custom\.(mp3|wav|ogg|m4a)$/i;
+const VERSIONED_SOUND_FILE_PATTERN = /^notification-custom-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(mp3|wav|ogg|m4a)$/i;
+
+function isKnownSoundFileName(fileName) {
+  return typeof fileName === 'string'
+    && path.basename(fileName) === fileName
+    && (LEGACY_SOUND_FILE_PATTERN.test(fileName) || VERSIONED_SOUND_FILE_PATTERN.test(fileName));
+}
+
+function findLegacyCustomSound() {
+  for (const extension of CUSTOM_SOUND_EXTENSIONS) {
+    const fileName = `notification-custom${extension}`;
+    try {
+      if (fs.statSync(path.join(userDataPath, fileName)).isFile()) return fileName;
+    } catch {
+      // Try the next legacy extension.
+    }
+  }
+  return null;
+}
 
 function loadSettings() {
   try {
-    if (fs.existsSync(settingsPath)) {
-      const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-      isMuted = !!data.muted;
+    const data = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+
+    isMuted = data.muted === true;
+    if (Object.prototype.hasOwnProperty.call(data, 'customSoundFile')) {
+      customSoundFile = isKnownSoundFileName(data.customSoundFile)
+        ? data.customSoundFile
+        : null;
+    } else {
+      // Migrate older installs once. An explicit null means reset and must not
+      // resurrect an old file left behind by a failed cleanup.
+      customSoundFile = findLegacyCustomSound();
     }
-  } catch { /* ignore */ }
-}
-
-function saveSettings() {
-  try {
-    let data = {};
-    try { data = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); } catch { /* ignore */ }
-    data.muted = isMuted;
-    fs.writeFileSync(settingsPath, JSON.stringify(data));
-  } catch { /* ignore */ }
-}
-
-// Meta retired the standalone messenger.com web app in favor of Facebook Messages.
-const MESSENGER_URL = 'https://www.facebook.com/messages/';
-const MESSENGER_PARTITION = 'persist:messenger';
-
-const LEGACY_MESSENGER_HOSTS = new Set(['messenger.com', 'www.messenger.com']);
-const FACEBOOK_HOSTS = new Set(['facebook.com', 'www.facebook.com']);
-const FACEBOOK_APP_PATHS = [
-  /^\/messages(?:\/|$)/,
-  /^\/login(?:\.php|\/|$)/,
-  /^\/checkpoint(?:\/|$)/,
-  /^\/recover(?:\/|$)/,
-  /^\/two_step_verification(?:\/|$)/,
-  /^\/auth_platform(?:\/|$)/,
-  /^\/privacy\/consent(?:\/|$)/,
-  /^\/cookie\/consent(?:\/|$)/,
-];
-
-function isAllowedAppUrl(rawUrl) {
-  try {
-    const url = new URL(rawUrl);
-    if (url.protocol !== 'https:') return false;
-
-    const hostname = url.hostname.toLowerCase();
-    if (LEGACY_MESSENGER_HOSTS.has(hostname)) return true;
-    if (hostname === 'm.facebook.com') return true;
-
-    return FACEBOOK_HOSTS.has(hostname)
-      && FACEBOOK_APP_PATHS.some(pattern => pattern.test(url.pathname));
   } catch {
-    return false;
+    isMuted = false;
+    customSoundFile = findLegacyCustomSound();
   }
 }
 
-function isTrustedPermissionUrl(rawUrl) {
-  try {
-    const url = new URL(rawUrl);
-    if (url.protocol !== 'https:') return false;
-
-    const hostname = url.hostname.toLowerCase();
-    return LEGACY_MESSENGER_HOSTS.has(hostname)
-      || FACEBOOK_HOSTS.has(hostname)
-      || hostname === 'm.facebook.com';
-  } catch {
-    return false;
-  }
-}
-
-loadSettings();
-
-// IPC handler for custom notification sound selection
-ipcMain.on('select-notification-sound', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Vyber zvuk oznámení',
-    filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
-    properties: ['openFile'],
+async function writeSettingsAtomic() {
+  await fs.promises.mkdir(userDataPath, { recursive: true });
+  const temporaryPath = `${settingsPath}.${crypto.randomUUID()}.tmp`;
+  const contents = JSON.stringify({
+    version: SETTINGS_VERSION,
+    muted: isMuted,
+    customSoundFile,
   });
-  if (!result.canceled && result.filePaths[0]) {
-    const dest = path.join(userDataPath, 'notification-custom.mp3');
-    fs.copyFileSync(result.filePaths[0], dest);
-    mainWindow.webContents.send('notification-sound-updated', dest);
+
+  let handle;
+  try {
+    handle = await fs.promises.open(temporaryPath, 'wx', 0o600);
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.promises.rename(temporaryPath, settingsPath);
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    await fs.promises.unlink(temporaryPath).catch(() => {});
+    throw error;
   }
-});
-
-ipcMain.on('reset-notification-sound', () => {
-  const custom = path.join(userDataPath, 'notification-custom.mp3');
-  if (fs.existsSync(custom)) fs.unlinkSync(custom);
-  mainWindow.webContents.send('notification-sound-updated', null);
-});
-
-// Notification sound
-
-function getNotificationSoundPath() {
-  const custom = path.join(userDataPath, 'notification-custom.mp3');
-  if (fs.existsSync(custom)) return custom;
-  // Check extraResources first (real file, not inside asar)
-  const prod = path.join(process.resourcesPath, 'notification.mp3');
-  if (fs.existsSync(prod) && !prod.includes('app.asar')) return prod;
-  // Dev mode fallback
-  const dev = path.join(__dirname, 'assets', 'notification.mp3');
-  return dev;
 }
 
-// Protocol handler is registered in app.whenReady below
+function enqueueSettingsOperation(operation) {
+  const result = settingsOperationQueue.then(operation);
+  settingsOperationQueue = result.catch((error) => {
+    console.error('Settings operation failed:', error.message);
+  });
+  return result;
+}
 
-ipcMain.on('get-mute-state', (event) => {
-  event.returnValue = isMuted;
+function flushSettingsOperationsOnce() {
+  if (settingsFlushPromise) return settingsFlushPromise;
+
+  const pendingOperations = settingsOperationQueue;
+  settingsFlushPromise = new Promise((resolve) => {
+    let settled = false;
+    const finish = (flushed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(flushed);
+    };
+    const timeout = setTimeout(() => {
+      console.warn('Timed out while flushing settings before exit.');
+      finish(false);
+    }, SETTINGS_FLUSH_TIMEOUT_MS);
+
+    pendingOperations.then(
+      () => finish(true),
+      (error) => {
+        console.error('Could not flush settings before exit:', error.message);
+        finish(false);
+      },
+    );
+  });
+  return settingsFlushPromise;
+}
+
+async function removeStoredCustomSounds(exceptFile = null) {
+  let entries;
+  try {
+    entries = await fs.promises.readdir(userDataPath, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isFile() || entry.name === exceptFile || !isKnownSoundFileName(entry.name)) return;
+    await fs.promises.unlink(path.join(userDataPath, entry.name)).catch(() => {});
+  }));
+}
+
+async function removeOrphanedTemporaryFiles() {
+  let entries;
+  try {
+    entries = await fs.promises.readdir(userDataPath, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isFile() || !isOwnedTemporaryFileName(entry.name)) return;
+    await fs.promises.unlink(path.join(userDataPath, entry.name)).catch(() => {});
+  }));
+}
+
+function getLiveMainWindow() {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+}
+
+function getLiveTray() {
+  return tray && !tray.isDestroyed() ? tray : null;
+}
+
+function showMainWindow() {
+  if (isQuitting) return null;
+  let win = getLiveMainWindow();
+  if (!win && app.isReady() && !isQuitting) {
+    try {
+      win = createWindow();
+    } catch (error) {
+      console.error('Could not recreate the Messenger window:', error.message);
+      return null;
+    }
+  }
+  if (!win) return null;
+  if (win.isMinimized()) win.restore();
+  if (!win.isVisible()) win.show();
+  win.focus();
+  return win;
+}
+
+function sendToMainWindow(channel, payload) {
+  const win = getLiveMainWindow();
+  if (!win || win.webContents.isDestroyed()) return;
+  win.webContents.send(channel, payload);
+}
+
+function applyNativeUnreadState() {
+  const win = getLiveMainWindow();
+  const liveTray = getLiveTray();
+  const hasUnread = currentUnreadCount > 0;
+  const title = hasUnread ? `Messenger (${currentUnreadCount})` : 'Messenger';
+  const tooltip = hasUnread
+    ? `Messenger - ${currentUnreadCount} nepřečtených zpráv`
+    : 'Messenger';
+
+  if (win) {
+    if (updatePhase !== 'downloading') win.setTitle(title);
+    win.setOverlayIcon(hasUnread ? currentBadgeIcon : null, hasUnread ? tooltip : '');
+  }
+
+  if (liveTray) {
+    if (hasUnread && currentBadgeIcon && !currentBadgeIcon.isEmpty()) {
+      liveTray.setImage(currentBadgeIcon.resize({ width: 16, height: 16 }));
+    } else if (trayBaseIcon && !trayBaseIcon.isEmpty()) {
+      liveTray.setImage(trayBaseIcon);
+    }
+    liveTray.setToolTip(tooltip);
+  }
+}
+
+function isTrustedMainFrameIpc(event) {
+  const win = getLiveMainWindow();
+  if (!win || event.sender !== win.webContents || event.sender.isDestroyed()) return false;
+
+  const senderFrame = event.senderFrame;
+  const mainFrame = win.webContents.mainFrame;
+  if (!senderFrame || !mainFrame) return false;
+
+  const isSameFrame = senderFrame === mainFrame
+    || (senderFrame.processId === mainFrame.processId && senderFrame.routingId === mainFrame.routingId);
+  return isSameFrame && isAllowedAppUrl(senderFrame.url || event.sender.getURL());
+}
+
+ipcMain.on('publish-unread-state', (event, rawPayload) => {
+  if (!isTrustedMainFrameIpc(event)) return;
+
+  const payload = validateUnreadStatePayload(rawPayload);
+  if (!payload) return;
+
+  const nextBadgeIcon = payload.badgeDataUrl
+    ? createUsableBadgeImage(payload.badgeDataUrl, (dataUrl) => nativeImage.createFromDataURL(dataUrl))
+    : null;
+
+  currentUnreadCount = payload.count;
+  currentBadgeIcon = payload.count > 0 ? nextBadgeIcon : null;
+  applyNativeUnreadState();
+
+  if (payload.notify && !isMuted) sendToMainWindow('play-notification-sound');
 });
 
-ipcMain.on('set-mute-state', (event, muted) => {
-  isMuted = !!muted;
-  saveSettings();
-  // Update menus to reflect new state
+async function getNotificationSoundPath() {
+  const candidates = [];
+  if (isKnownSoundFileName(customSoundFile)) {
+    candidates.push(path.join(userDataPath, customSoundFile));
+  }
+  if (app.isPackaged) candidates.push(path.join(process.resourcesPath, 'notification.mp3'));
+  candidates.push(path.join(__dirname, 'assets', 'notification.mp3'));
+
+  for (const candidate of candidates) {
+    try {
+      await validateSoundFile(candidate, path.extname(candidate).toLowerCase());
+      return candidate;
+    } catch {
+      // A stale, corrupt, or legacy-mismatched custom sound falls through to
+      // the bundled default instead of leaving notifications silent.
+    }
+  }
+  return null;
+}
+
+function getNotificationSoundContentType(soundPath) {
+  switch (path.extname(soundPath).toLowerCase()) {
+    case '.wav': return 'audio/wav';
+    case '.ogg': return 'audio/ogg';
+    case '.m4a': return 'audio/mp4';
+    default: return 'audio/mpeg';
+  }
+}
+
+async function validateSoundFile(soundPath, extension) {
+  const stat = await fs.promises.stat(soundPath);
+  if (!stat.isFile() || stat.size < 4 || stat.size > MAX_SOUND_BYTES) {
+    throw new Error('Sound file has an invalid size.');
+  }
+
+  const handle = await fs.promises.open(soundPath, 'r');
+  try {
+    const header = Buffer.alloc(32);
+    const { bytesRead } = await handle.read(header, 0, header.length, 0);
+    if (!soundHeaderMatchesExtension(header.subarray(0, bytesRead), extension)) {
+      throw new Error('Sound file content does not match its extension.');
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function copySoundFileBounded(sourcePath, destinationPath) {
+  const source = await fs.promises.open(sourcePath, 'r');
+  let destination;
+  try {
+    destination = await fs.promises.open(destinationPath, 'wx', 0o600);
+    const chunk = Buffer.alloc(64 * 1024);
+    let totalBytes = 0;
+
+    while (true) {
+      const { bytesRead } = await source.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      totalBytes += bytesRead;
+      if (totalBytes > MAX_SOUND_BYTES) throw new Error('Sound file is too large.');
+
+      let written = 0;
+      while (written < bytesRead) {
+        const result = await destination.write(chunk, written, bytesRead - written, null);
+        if (result.bytesWritten < 1) throw new Error('Could not finish writing the sound file.');
+        written += result.bytesWritten;
+      }
+    }
+
+    if (totalBytes < 4) throw new Error('Sound file is empty.');
+    await destination.sync();
+  } finally {
+    await source.close().catch(() => {});
+    if (destination) await destination.close().catch(() => {});
+  }
+}
+
+async function installCustomSound(sourcePath) {
+  const extension = path.extname(sourcePath).toLowerCase();
+  if (!CUSTOM_SOUND_EXTENSIONS.has(extension)) throw new Error('Unsupported sound extension.');
+  await validateSoundFile(sourcePath, extension);
+
+  await fs.promises.mkdir(userDataPath, { recursive: true });
+  const nextFile = `notification-custom-${crypto.randomUUID()}${extension}`;
+  const temporaryPath = path.join(userDataPath, `.${nextFile}.${crypto.randomUUID()}.tmp`);
+  const destinationPath = path.join(userDataPath, nextFile);
+
+  try {
+    await copySoundFileBounded(sourcePath, temporaryPath);
+    await validateSoundFile(temporaryPath, extension);
+    await fs.promises.rename(temporaryPath, destinationPath);
+
+    const previousFile = customSoundFile;
+    customSoundFile = nextFile;
+    try {
+      // Persist the new pointer before deleting any prior sound.
+      await writeSettingsAtomic();
+    } catch (error) {
+      customSoundFile = previousFile;
+      await fs.promises.unlink(destinationPath).catch(() => {});
+      throw error;
+    }
+
+    await removeStoredCustomSounds(nextFile);
+    sendToMainWindow('notification-sound-updated');
+  } catch (error) {
+    await fs.promises.unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+}
+
+async function showSoundError() {
+  const win = getLiveMainWindow();
+  if (!win) return;
+  await dialog.showMessageBox(win, {
+    type: 'error',
+    title: 'Chyba zvuku',
+    message: 'Vybraný zvuk se nepodařilo bezpečně uložit.',
+  }).catch(() => {});
+}
+
+async function selectNotificationSound() {
+  if (isSelectingSound) return;
+  const win = showMainWindow();
+  if (!win) return;
+
+  isSelectingSound = true;
+  try {
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Vyber zvuk oznámení',
+      filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a'] }],
+      properties: ['openFile'],
+    });
+    if (isQuitting || result.canceled || !result.filePaths[0]) return;
+
+    await enqueueSettingsOperation(() => installCustomSound(result.filePaths[0]));
+  } catch (error) {
+    console.error('Custom sound install failed:', error.message);
+    await showSoundError();
+  } finally {
+    isSelectingSound = false;
+  }
+}
+
+function resetNotificationSound() {
+  if (isQuitting) return;
+  void enqueueSettingsOperation(async () => {
+    const previousFile = customSoundFile;
+    customSoundFile = null;
+    try {
+      // Explicit null prevents legacy files from being rediscovered on restart.
+      await writeSettingsAtomic();
+    } catch (error) {
+      customSoundFile = previousFile;
+      throw error;
+    }
+    await removeStoredCustomSounds();
+    sendToMainWindow('notification-sound-updated');
+  }).catch(() => {
+    void showSoundError();
+  });
+}
+
+function setMuted(nextMuted) {
+  if (isQuitting) return;
+  // Apply the user's choice synchronously so a notification in the same turn
+  // cannot beat the settings write. Persistence remains serialized and atomic.
+  isMuted = nextMuted === true;
+  if (isMuted) sendToMainWindow('stop-notification-sound');
   rebuildMenus();
-  if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
-});
+  void enqueueSettingsOperation(writeSettingsAtomic).catch(() => {});
+}
 
-ipcMain.on('play-notification-sound', () => {
-  if (isMuted) return;
-  const soundPath = getNotificationSoundPath();
-  console.log('NAV playing sound:', soundPath);
-  const { exec } = require('child_process');
-  exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName presentationCore; $p = New-Object system.windows.media.mediaplayer; $p.open([uri]'${soundPath.replace(/'/g, "''")}'); Start-Sleep -Milliseconds 300; $p.Play(); Start-Sleep -Seconds 3"`);
-});
+function isExactSoundRequest(request) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return false;
+  try {
+    const url = new URL(request.url);
+    if (
+      url.protocol !== `${CUSTOM_PROTOCOL}:`
+      || url.hostname !== 'notification'
+      || url.pathname !== '/sound'
+      || url.username
+      || url.password
+      || url.port
+      || url.hash
+    ) return false;
 
-// IPC handler for badge overlay (taskbar - pulsing)
-ipcMain.on('set-badge', (event, dataUrl) => {
-  if (!mainWindow) return;
-  if (dataUrl) {
-    const icon = nativeImage.createFromDataURL(dataUrl);
-    mainWindow.setOverlayIcon(icon, 'Nepřečtené zprávy');
-  } else {
-    mainWindow.setOverlayIcon(null, '');
+    const keys = [...url.searchParams.keys()];
+    if (keys.length === 0) return true;
+    return keys.length === 1
+      && keys[0] === 'v'
+      && /^\d{1,10}$/.test(url.searchParams.get('v') || '');
+  } catch {
+    return false;
   }
-});
+}
 
-// IPC handler for tray badge (static, no pulsing)
-ipcMain.on('set-tray-badge', (event, dataUrl) => {
-  if (!tray) return;
-  if (dataUrl) {
-    const icon = nativeImage.createFromDataURL(dataUrl).resize({ width: 16, height: 16 });
-    tray.setImage(icon);
-  } else {
-    const iconPath = path.join(__dirname, 'assets', 'icon.png');
-    const originalIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-    if (!originalIcon.isEmpty()) tray.setImage(originalIcon);
+async function handleCustomAssetRequest(request) {
+  if (!isExactSoundRequest(request)) {
+    return new Response(null, { status: request.method === 'GET' || request.method === 'HEAD' ? 404 : 405 });
   }
-});
+
+  try {
+    const soundPath = await getNotificationSoundPath();
+    if (!soundPath) return new Response(null, { status: 404 });
+    const handle = await fs.promises.open(soundPath, 'r');
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size < 1 || stat.size > MAX_SOUND_BYTES) {
+        return new Response(null, { status: 404 });
+      }
+
+      const headers = {
+        'Cache-Control': 'no-store',
+        'Content-Length': String(stat.size),
+        'Content-Type': getNotificationSoundContentType(soundPath),
+        'X-Content-Type-Options': 'nosniff',
+      };
+      if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
+
+      const contents = Buffer.alloc(stat.size);
+      let offset = 0;
+      while (offset < contents.length) {
+        const { bytesRead } = await handle.read(contents, offset, contents.length - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+
+      const overflowProbe = Buffer.alloc(1);
+      const { bytesRead: overflowBytes } = await handle.read(overflowProbe, 0, 1, offset);
+      if (offset !== stat.size || overflowBytes !== 0) return new Response(null, { status: 409 });
+      return new Response(contents, { status: 200, headers });
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    console.warn('Notification sound unavailable:', error.message);
+    return new Response(null, { status: 404 });
+  }
+}
+
+function openExternalSafely(rawUrl) {
+  if (classifyNavigationUrl(rawUrl) !== 'external') return;
+  void shell.openExternal(rawUrl).catch((error) => {
+    console.warn('Could not open external URL:', error.message);
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadUrlWithRetry(win, url, retryDelays = LOAD_RETRY_DELAYS_MS) {
+  if (!isAllowedAppUrl(url)) return false;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    if (isQuitting || win.isDestroyed()) return false;
+    try {
+      await win.loadURL(url);
+      return true;
+    } catch (error) {
+      if (isExpectedNavigationAbort(error)
+        && isAllowedAppUrl(win.webContents.getURL())) {
+        return true;
+      }
+      console.warn(`Messenger load attempt ${attempt + 1} failed:`, error.message);
+      if (attempt === retryDelays.length) throw error;
+      await delay(retryDelays[attempt]);
+    }
+  }
+  return false;
+}
+
+function routePopupToMain(url) {
+  const classification = classifyNavigationUrl(url);
+  if (classification === 'external') {
+    openExternalSafely(url);
+  } else if (classification === 'internal') {
+    const win = getLiveMainWindow();
+    if (win) void loadUrlWithRetry(win, url, []).catch(() => {});
+  }
+}
+
+function guardNavigation(event, legacyUrl, _legacyIsInPlace, legacyIsMainFrame) {
+  const url = event.url || legacyUrl;
+  const isMainFrame = typeof event.isMainFrame === 'boolean'
+    ? event.isMainFrame
+    : legacyIsMainFrame;
+  // The host page legitimately uses cross-origin embedded frames. The main-frame
+  // boundary is the one this app owns and can safely route.
+  if (isMainFrame === false) return;
+
+  const classification = classifyNavigationUrl(url);
+  if (classification === 'internal') return;
+
+  event.preventDefault();
+  if (classification === 'external') openExternalSafely(url);
+}
+
+function recoverUnexpectedInPageNavigation(url, isMainFrame) {
+  if (isMainFrame === false) return;
+  const classification = classifyNavigationUrl(url);
+  if (classification === 'internal') {
+    lastAllowedAppUrl = url;
+    return;
+  }
+
+  if (classification === 'external') openExternalSafely(url);
+  const win = getLiveMainWindow();
+  if (win) void loadUrlWithRetry(win, lastAllowedAppUrl, []).catch(() => {});
+}
 
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 400,
@@ -184,146 +621,108 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       spellcheck: true,
       partition: MESSENGER_PARTITION,
+      autoplayPolicy: 'no-user-gesture-required',
     },
     autoHideMenuBar: true,
     backgroundColor: '#000000',
     show: true,
   });
+  mainWindow = win;
 
-  // Fake user agent so FB doesn't block us
-  const userAgent = mainWindow.webContents.getUserAgent()
+  const userAgent = win.webContents.getUserAgent()
     .replace(/Electron\/\S+\s/, '')
     .replace(/messenger-app\/\S+\s/, '');
-  mainWindow.webContents.setUserAgent(userAgent);
+  win.webContents.setUserAgent(userAgent);
 
-  mainWindow.loadURL(MESSENGER_URL);
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    routePopupToMain(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-frame-navigate', guardNavigation);
+  win.webContents.on('will-redirect', guardNavigation);
+  win.webContents.on('did-navigate-in-page', (_event, url, isMainFrame) => {
+    recoverUnexpectedInPageNavigation(url, isMainFrame);
+  });
+  win.webContents.on('did-navigate', (_event, url) => {
+    if (isAllowedAppUrl(url)) lastAllowedAppUrl = url;
+  });
+  win.webContents.on('will-prevent-unload', (event) => {
+    permitUnloadForApplicationQuit(event, isQuitting);
+  });
 
-  // Forward console logs from renderer to main process
-  mainWindow.webContents.on('console-message', (e) => {
-    const message = e.message || '';
-    if (message.startsWith('NAV') || message.startsWith('  ')) {
-      console.log('[renderer]', message);
+  win.webContents.on('page-title-updated', (event, title) => {
+    event.preventDefault();
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send('title-unread-hint', getTitleUnreadHint(title));
     }
+    applyNativeUnreadState();
   });
 
-  mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
+  win.once('ready-to-show', () => {
+    if (!isQuitting && !win.isDestroyed()) win.show();
   });
 
-  // Open external links in default browser
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (!isAllowedAppUrl(url)) {
-      shell.openExternal(url);
-      return { action: 'deny' };
-    }
-    return { action: 'allow' };
-  });
-
-  // Keep Messenger and Facebook auth inside the app, open everything else externally.
-  const handleNavigation = (event, url) => {
-    if (event.isMainFrame === false) return;
-
-    const targetUrl = event.url || url;
-    if (!isAllowedAppUrl(targetUrl)) {
+  win.on('close', (event) => {
+    if (!isQuitting && getLiveTray()) {
       event.preventDefault();
-      shell.openExternal(targetUrl);
-    }
-  };
-  mainWindow.webContents.on('will-navigate', handleNavigation);
-  mainWindow.webContents.on('will-redirect', handleNavigation);
-
-  // Minimize to tray instead of closing (only if tray exists)
-  mainWindow.on('close', (event) => {
-    if (!isQuitting && tray) {
-      event.preventDefault();
-      mainWindow.hide();
+      win.hide();
     }
   });
-
-  // Badge count from title changes (Messenger shows unread count in title)
-  mainWindow.webContents.on('page-title-updated', (event, title) => {
-    const match = title.match(/\((\d+)\)/);
-    const count = match ? parseInt(match[1]) : 0;
-    if (count > 0) {
-      mainWindow.setTitle(`Messenger (${count})`);
-      if (tray) tray.setToolTip(`Messenger - ${count} neprectenych zprav`);
-    } else {
-      mainWindow.setTitle('Messenger');
-      if (tray) tray.setToolTip('Messenger');
-    }
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null;
   });
+
+  applyNativeUnreadState();
+  void loadUrlWithRetry(win, MESSENGER_URL).catch((error) => {
+    console.error('Messenger load failed:', error.message);
+  });
+  return win;
 }
 
 function createTray() {
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
-
   if (!fs.existsSync(iconPath)) {
-    console.log('No tray icon found at', iconPath, '- skipping tray');
+    console.warn('No tray icon found; tray disabled.');
     return;
   }
 
-  const trayIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
-  if (trayIcon.isEmpty()) {
-    console.log('Tray icon is empty - skipping tray');
+  trayBaseIcon = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+  if (trayBaseIcon.isEmpty()) {
+    console.warn('Tray icon is empty; tray disabled.');
+    trayBaseIcon = null;
     return;
   }
 
-  tray = new Tray(trayIcon);
+  tray = new Tray(trayBaseIcon);
+  tray.on('click', showMainWindow);
   updateTrayMenu();
-  tray.setToolTip('Messenger');
-  tray.on('click', () => {
-    mainWindow.show();
-    mainWindow.focus();
-  });
+  applyNativeUnreadState();
 }
 
 function updateTrayMenu() {
-  if (!tray) return;
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: 'Otevrit Messenger',
-      click: () => {
-        mainWindow.show();
-        mainWindow.focus();
-      },
-    },
+  const liveTray = getLiveTray();
+  if (!liveTray) return;
+
+  liveTray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Otevřít Messenger', click: showMainWindow },
     { type: 'separator' },
     {
       label: 'Ztlumit zvuky',
       type: 'checkbox',
       checked: isMuted,
-      click: (menuItem) => {
-        isMuted = menuItem.checked;
-        saveSettings();
-        rebuildMenus();
-        if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
-      },
+      click: (menuItem) => setMuted(menuItem.checked),
     },
-    {
-      label: 'Změnit zvuk oznámení...',
-      click: () => {
-        mainWindow.webContents.send('open-sound-picker');
-      },
-    },
-    {
-      label: 'Výchozí zvuk oznámení',
-      click: () => {
-        ipcMain.emit('reset-notification-sound');
-      },
-    },
+    { label: 'Změnit zvuk oznámení...', click: () => void selectNotificationSound() },
+    { label: 'Výchozí zvuk oznámení', click: resetNotificationSound },
     { type: 'separator' },
     {
-      label: 'Ukoncit',
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      },
+      label: 'Ukončit',
+      click: requestApplicationQuit,
     },
-  ]);
-  tray.setContextMenu(contextMenu);
+  ]));
 }
 
 function createMenu() {
@@ -332,12 +731,15 @@ function createMenu() {
       label: 'Soubor',
       submenu: [
         {
-          label: 'Novy chat',
+          label: 'Nový chat',
           accelerator: 'CmdOrCtrl+N',
           click: () => {
-            mainWindow.webContents.executeJavaScript(`
-              document.querySelector('[aria-label="New message"]')?.click();
-            `);
+            const win = getLiveMainWindow();
+            if (!win) return;
+            void win.webContents.executeJavaScript(
+              `document.querySelector('[aria-label="New message"], [aria-label="Nová zpráva"]')?.click();`,
+              true,
+            ).catch(() => {});
           },
         },
         { type: 'separator' },
@@ -346,60 +748,42 @@ function createMenu() {
           type: 'checkbox',
           checked: isMuted,
           accelerator: 'CmdOrCtrl+Shift+M',
-          click: (menuItem) => {
-            isMuted = menuItem.checked;
-            saveSettings();
-            updateTrayMenu();
-            if (mainWindow) mainWindow.webContents.send('mute-state-changed', isMuted);
-          },
+          click: (menuItem) => setMuted(menuItem.checked),
         },
-        {
-          label: 'Změnit zvuk oznámení...',
-          click: () => {
-            mainWindow.webContents.send('open-sound-picker');
-          },
-        },
-        {
-          label: 'Výchozí zvuk oznámení',
-          click: () => {
-            ipcMain.emit('reset-notification-sound');
-          },
-        },
+        { label: 'Změnit zvuk oznámení...', click: () => void selectNotificationSound() },
+        { label: 'Výchozí zvuk oznámení', click: resetNotificationSound },
         { type: 'separator' },
         {
-          label: 'Ukoncit',
+          label: 'Ukončit',
           accelerator: 'CmdOrCtrl+Q',
-          click: () => {
-            isQuitting = true;
-            app.quit();
-          },
+          click: requestApplicationQuit,
         },
       ],
     },
     {
       label: 'Upravit',
       submenu: [
-        { role: 'undo', label: 'Zpet' },
-        { role: 'redo', label: 'Vpred' },
+        { role: 'undo', label: 'Zpět' },
+        { role: 'redo', label: 'Vpřed' },
         { type: 'separator' },
-        { role: 'cut', label: 'Vystrihnout' },
-        { role: 'copy', label: 'Kopirovat' },
-        { role: 'paste', label: 'Vlozit' },
-        { role: 'selectAll', label: 'Vybrat vse' },
+        { role: 'cut', label: 'Vyjmout' },
+        { role: 'copy', label: 'Kopírovat' },
+        { role: 'paste', label: 'Vložit' },
+        { role: 'selectAll', label: 'Vybrat vše' },
       ],
     },
     {
       label: 'Zobrazit',
       submenu: [
         { role: 'reload', label: 'Obnovit' },
-        { role: 'forceReload', label: 'Vynutit obnoveni' },
+        { role: 'forceReload', label: 'Vynutit obnovení' },
         { type: 'separator' },
-        { role: 'zoomIn', label: 'Priblizit' },
-        { role: 'zoomOut', label: 'Oddabit' },
-        { role: 'resetZoom', label: 'Puvodni velikost' },
+        { role: 'zoomIn', label: 'Přiblížit' },
+        { role: 'zoomOut', label: 'Oddálit' },
+        { role: 'resetZoom', label: 'Původní velikost' },
         { type: 'separator' },
         { role: 'togglefullscreen', label: 'Celá obrazovka' },
-        { role: 'toggleDevTools', label: 'Vyvojarské nastroje' },
+        { role: 'toggleDevTools', label: 'Vývojářské nástroje' },
       ],
     },
   ];
@@ -411,150 +795,272 @@ function rebuildMenus() {
   updateTrayMenu();
 }
 
-// Notifications - allow them
-app.on('ready', () => {
-  const messengerSession = session.fromPartition(MESSENGER_PARTITION);
-  const allowedPermissions = new Set([
-    'notifications',
-    'media',
-    'mediaKeySystem',
-    'clipboard-read',
-    'clipboard-sanitized-write',
-  ]);
-  const canGrantPermission = (permission, requestingUrl, isMainFrame) => (
-    isMainFrame
-    && allowedPermissions.has(permission)
-    && isTrustedPermissionUrl(requestingUrl)
-  );
+function cancelStartupUpdateCheck() {
+  if (!updateTimer) return;
+  clearTimeout(updateTimer);
+  updateTimer = null;
+}
 
-  messengerSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
-    const requestingUrl = details.requestingUrl
-      || details.securityOrigin
-      || requestingOrigin
-      || webContents?.getURL()
-      || '';
-    return canGrantPermission(permission, requestingUrl, details.isMainFrame);
-  });
+function requestApplicationQuit() {
+  if (isQuitting) return;
+  isQuitting = true;
+  cancelStartupUpdateCheck();
+  app.quit();
+}
 
-  messengerSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const requestingUrl = details.requestingUrl
-      || details.securityOrigin
-      || webContents.getURL();
-    callback(canGrantPermission(permission, requestingUrl, details.isMainFrame));
-  });
-});
+async function restartForInstalledUpdate() {
+  if (isQuitting) return;
+  isQuitting = true;
+  quitFlushState = 'flushing';
+  cancelStartupUpdateCheck();
+  await flushSettingsOperationsOnce();
+  quitFlushState = 'complete';
+  restartPending = true;
 
-// When a second instance tries to start, focus the existing window
-app.on('second-instance', () => {
-  if (mainWindow) {
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+  try {
+    autoUpdater.quitAndInstall(true, true);
+    // BaseUpdater schedules app.quit() with setImmediate when installation starts.
+    // Our before-quit handler clears restartPending first. If that never happens,
+    // installation was rejected and the still-running app must become usable again.
+    setImmediate(() => {
+      if (!restartPending) return;
+      const error = new Error('Instalátor aktualizace se nepodařilo spustit.');
+      recoverFailedUpdateRestart(error);
+      void showUpdateError(error);
+    });
+  } catch (error) {
+    recoverFailedUpdateRestart(error);
+    void showUpdateError(error);
   }
-});
+}
 
-// Auto-updater via GitHub releases
+function recoverFailedUpdateRestart(error) {
+  if (!restartPending) return false;
+  restartPending = false;
+  isQuitting = false;
+  quitFlushState = 'idle';
+  settingsFlushPromise = null;
+  updatePhase = 'idle';
+  showMainWindow();
+  restoreNativeUpdateUi();
+  console.error('Could not restart into the downloaded update:', error.message);
+  return true;
+}
+
+function getPermissionRequestUrl(webContents, requestingOrigin, details = {}) {
+  // Never replace an explicit untrusted requester with the trusted top-level URL.
+  // Chromium omits requestingUrl for some checks, hence the ordered fallbacks.
+  return details.requestingUrl
+    || details.securityOrigin
+    || requestingOrigin
+    || webContents?.getURL()
+    || '';
+}
+
+function configureSessionPermissions(messengerSession) {
+  messengerSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details = {}) => (
+    isAllowedPermissionRequest({
+      permission,
+      requestingUrl: getPermissionRequestUrl(webContents, requestingOrigin, details),
+      isMainFrame: details.isMainFrame,
+      mediaTypes: normalizeRequestedMediaTypes(details),
+    })
+  ));
+
+  messengerSession.setPermissionRequestHandler((webContents, permission, callback, details = {}) => {
+    const allowed = isAllowedPermissionRequest({
+      permission,
+      requestingUrl: getPermissionRequestUrl(webContents, '', details),
+      isMainFrame: details.isMainFrame,
+      mediaTypes: normalizeRequestedMediaTypes(details),
+    });
+    callback(allowed);
+  });
+}
+
+function restoreNativeUpdateUi() {
+  const win = getLiveMainWindow();
+  if (win) win.setProgressBar(-1);
+  applyNativeUnreadState();
+}
+
+async function promptForAvailableUpdate(info) {
+  if (updatePromptOpen || isQuitting) return;
+  const win = showMainWindow();
+  if (!win) {
+    updatePhase = 'idle';
+    return;
+  }
+
+  updatePromptOpen = true;
+  try {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Nová verze k dispozici',
+      message: `Je dostupná nová verze: v${info.version}`,
+      buttons: ['Aktualizovat', 'Později'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response !== 0 || isQuitting || !getLiveMainWindow()) {
+      updatePhase = 'idle';
+      return;
+    }
+
+    updatePhase = 'downloading';
+    const liveWindow = getLiveMainWindow();
+    if (liveWindow) {
+      liveWindow.setTitle('Messenger - Stahování aktualizace... 0%');
+      liveWindow.setProgressBar(0);
+    }
+    await autoUpdater.downloadUpdate().catch((error) => {
+      updatePhase = 'idle';
+      restoreNativeUpdateUi();
+      console.error('Update download failed:', error.message);
+      void showUpdateError(error);
+    });
+  } catch (error) {
+    updatePhase = 'idle';
+    console.error('Update prompt failed:', error.message);
+  } finally {
+    updatePromptOpen = false;
+  }
+}
+
+async function showUpdateError(error) {
+  if (updateErrorPromptOpen || isQuitting) return;
+  const win = getLiveMainWindow();
+  if (!win) return;
+
+  updateErrorPromptOpen = true;
+  try {
+    await dialog.showMessageBox(win, {
+      type: 'error',
+      title: 'Chyba aktualizace',
+      message: `Aktualizace selhala: ${error.message}`,
+      buttons: ['OK'],
+      noLink: true,
+    });
+  } catch {
+    // The window may have closed while the dialog was pending.
+  } finally {
+    updateErrorPromptOpen = false;
+  }
+}
+
 autoUpdater.autoDownload = false;
 autoUpdater.autoInstallOnAppQuit = true;
 autoUpdater.on('checking-for-update', () => {
-  console.log('NAV updater: checking for updates...');
+  updatePhase = 'checking';
+  console.log('Updater: checking for updates...');
 });
-
 autoUpdater.on('update-not-available', () => {
-  console.log('NAV updater: no update available');
+  updatePhase = 'idle';
+  console.log('Updater: no update available');
 });
-
 autoUpdater.on('update-available', (info) => {
-  console.log('NAV update available:', info.version);
-  // Wait for window to be ready
-  const showDialog = () => {
-    if (!mainWindow || !mainWindow.isVisible()) {
-      setTimeout(showDialog, 1000);
-      return;
-    }
-    dialog.showMessageBox(mainWindow, {
-    type: 'info',
-    title: 'Nová verze k dispozici',
-    message: `Je dostupná nová verze: v${info.version}`,
-    buttons: ['Aktualizovat', 'Později'],
-    defaultId: 0,
-  }).then(({ response }) => {
-    if (response === 0) {
-      // Show progress in title bar + taskbar
-      mainWindow.setTitle('Messenger - Stahování aktualizace... 0%');
-      mainWindow.setProgressBar(0);
-      autoUpdater.downloadUpdate();
-    }
-  });
-  };
-  showDialog();
+  if (!shouldHandleUpdateAvailable({ isQuitting, updatePromptOpen, updatePhase })) {
+    console.log('Updater: ignoring duplicate update-available event');
+    return;
+  }
+  updatePhase = 'available';
+  console.log('Updater: update available:', info.version);
+  void promptForAvailableUpdate(info);
 });
-
 autoUpdater.on('download-progress', (progress) => {
-  const pct = Math.round(progress.percent);
-  const mb = Math.round(progress.transferred / 1024 / 1024);
-  const totalMb = Math.round(progress.total / 1024 / 1024);
-  if (mainWindow) {
-    mainWindow.setTitle(`Messenger - Stahování aktualizace... ${pct}% (${mb}/${totalMb} MB)`);
-    mainWindow.setProgressBar(pct / 100);
-  }
+  if (updatePhase !== 'downloading') return;
+  const percent = Number.isFinite(progress.percent)
+    ? Math.max(0, Math.min(100, Math.round(progress.percent)))
+    : 0;
+  const transferred = Number.isFinite(progress.transferred) ? Math.max(0, progress.transferred) : 0;
+  const total = Number.isFinite(progress.total) ? Math.max(0, progress.total) : 0;
+  const win = getLiveMainWindow();
+  if (!win) return;
+  win.setTitle(`Messenger - Stahování aktualizace... ${percent}% (${Math.round(transferred / 1048576)}/${Math.round(total / 1048576)} MB)`);
+  win.setProgressBar(percent / 100);
 });
-
 autoUpdater.on('update-downloaded', () => {
-  if (mainWindow) {
-    mainWindow.setTitle('Messenger');
-    mainWindow.setProgressBar(-1);
-  }
-  dialog.showMessageBox(mainWindow, {
+  updatePhase = 'downloaded';
+  restoreNativeUpdateUi();
+  const win = showMainWindow();
+  if (!win || isQuitting) return;
+
+  void dialog.showMessageBox(win, {
     type: 'info',
     title: 'Aktualizace připravena',
     message: 'Aktualizace byla stažena. Aplikace se nyní restartuje.',
     buttons: ['OK'],
+    noLink: true,
   }).then(() => {
-    autoUpdater.quitAndInstall(true, true);
+    if (!isQuitting) void restartForInstalledUpdate();
+  }).catch((error) => {
+    console.error('Downloaded update prompt failed:', error.message);
   });
 });
-
-autoUpdater.on('error', (err) => {
-  console.log('NAV updater error:', err.message);
-  if (mainWindow) {
-    mainWindow.setTitle('Messenger');
-    mainWindow.setProgressBar(-1);
-  }
-  dialog.showMessageBox(mainWindow, {
-    type: 'error',
-    title: 'Chyba aktualizace',
-    message: `Aktualizace selhala: ${err.message}`,
-  });
+autoUpdater.on('error', (error) => {
+  const failedPhase = updatePhase;
+  const failedRestart = recoverFailedUpdateRestart(error);
+  updatePhase = 'idle';
+  restoreNativeUpdateUi();
+  console.error('Updater error:', error.message);
+  // Startup update checks are best-effort and should never interrupt the user.
+  if (failedPhase === 'downloading' || failedRestart) void showUpdateError(error);
 });
 
-app.whenReady().then(() => {
-  // Register protocol handler for local audio files
-  protocol.handle('messenger-asset', () => {
-    const soundPath = getNotificationSoundPath();
-    return new Response(fs.readFileSync(soundPath), {
-      headers: { 'Content-Type': 'audio/mpeg' }
+function scheduleStartupUpdateCheck() {
+  if (!app.isPackaged || updateTimer || isQuitting) return;
+  updateTimer = setTimeout(() => {
+    updateTimer = null;
+    if (isQuitting) return;
+    void autoUpdater.checkForUpdates().catch((error) => {
+      updatePhase = 'idle';
+      console.error('Startup update check failed:', error.message);
+    });
+  }, UPDATE_DELAY_MS);
+}
+
+if (gotLock) {
+  loadSettings();
+  void enqueueSettingsOperation(removeOrphanedTemporaryFiles);
+
+  app.on('second-instance', showMainWindow);
+
+  app.whenReady().then(() => {
+    const messengerSession = session.fromPartition(MESSENGER_PARTITION);
+    configureSessionPermissions(messengerSession);
+    messengerSession.protocol.handle(CUSTOM_PROTOCOL, handleCustomAssetRequest);
+
+    createWindow();
+    createTray();
+    createMenu();
+    scheduleStartupUpdateCheck();
+  }).catch((error) => {
+    console.error('Application startup failed:', error);
+    app.quit();
+  });
+
+  app.on('before-quit', (event) => {
+    // A successful quitAndInstall reaches here from its earlier setImmediate.
+    // Clearing this flag prevents our later fallback from reviving quit state.
+    restartPending = false;
+    isQuitting = true;
+    cancelStartupUpdateCheck();
+    if (quitFlushState === 'complete') return;
+
+    event.preventDefault();
+    if (quitFlushState === 'flushing') return;
+    quitFlushState = 'flushing';
+
+    void flushSettingsOperationsOnce().finally(() => {
+      quitFlushState = 'complete';
+      app.quit();
     });
   });
 
-  createWindow();
-  createTray();
-  createMenu();
+  app.on('window-all-closed', () => {
+    app.quit();
+  });
 
-  // Check for updates shortly after start
-  setTimeout(() => autoUpdater.checkForUpdates(), 1000);
-});
-
-app.on('before-quit', () => {
-  isQuitting = true;
-});
-
-app.on('window-all-closed', () => {
-  app.quit();
-});
-
-app.on('activate', () => {
-  if (mainWindow) {
-    mainWindow.show();
-  }
-});
+  app.on('activate', showMainWindow);
+}
