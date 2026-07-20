@@ -1,167 +1,175 @@
+'use strict';
+
 const { ipcRenderer } = require('electron');
 
-const sendBadge = (dataUrl) => ipcRenderer.send('set-badge', dataUrl);
-const sendTrayBadge = (dataUrl) => ipcRenderer.send('set-tray-badge', dataUrl);
-const selectNotificationSound = () => ipcRenderer.send('select-notification-sound');
-
-let isMuted = ipcRenderer.sendSync('get-mute-state');
+const SOUND_URL = 'messenger-asset://notification/sound';
+const AUDIO_COALESCE_MS = 300;
+const TITLE_BASELINE_CAPTURE_MS = 1500;
 let notificationAudio = null;
 let notificationAudioVersion = 0;
-let lastUnreadCount = null;
-let unreadBaselineReady = false;
-let unreadBaselineTimer = null;
-let domUnreadCount = null;
-let titleUnreadCount = 0;
-
-const UNREAD_BASELINE_SETTLE_MS = 5000;
+let playScheduled = false;
+let lastAudioStart = -Infinity;
+let audioActionGeneration = 0;
 
 function getNotificationAudio() {
   if (!notificationAudio) {
-    notificationAudio = new Audio(`messenger-asset://notification/sound?v=${notificationAudioVersion}`);
+    notificationAudio = new Audio(`${SOUND_URL}?v=${notificationAudioVersion}`);
     notificationAudio.preload = 'auto';
   }
   return notificationAudio;
 }
 
-function reloadNotificationAudio() {
-  if (!notificationAudio) return;
-
-  notificationAudio.pause();
-  notificationAudioVersion += 1;
-  notificationAudio.src = `messenger-asset://notification/sound?v=${notificationAudioVersion}`;
-  notificationAudio.load();
-}
-
-function playNotificationSound() {
-  if (isMuted) return;
-
-  const audio = getNotificationAudio();
-  audio.currentTime = 0;
-  void audio.play().catch(() => {
-    // A failed custom sound must not affect Messenger itself.
+function scheduleNotificationSound() {
+  if (playScheduled || performance.now() - lastAudioStart < AUDIO_COALESCE_MS) return;
+  playScheduled = true;
+  const generation = audioActionGeneration;
+  queueMicrotask(() => {
+    if (generation !== audioActionGeneration) return;
+    playScheduled = false;
+    lastAudioStart = performance.now();
+    const audio = getNotificationAudio();
+    audio.currentTime = 0;
+    void audio.play().catch(() => {
+      // A missing/unsupported custom sound must never affect Messenger itself.
+    });
   });
 }
 
-function createBadgeDataUrl(count, size = 48) {
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return null;
-
-  ctx.fillStyle = '#cc0000';
-  ctx.beginPath();
-  ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.strokeStyle = 'white';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(size / 2, size / 2, size / 2 - 1, 0, Math.PI * 2);
-  ctx.stroke();
-
-  const text = count > 99 ? '99+' : String(count);
-  ctx.fillStyle = 'white';
-  ctx.font = `bold ${text.length > 2 ? 16 : text.length > 1 ? 22 : 28}px Arial`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, size / 2, size / 2 + 1);
-
-  return canvas.toDataURL('image/png');
+function stopNotificationSound() {
+  audioActionGeneration += 1;
+  playScheduled = false;
+  if (!notificationAudio) return;
+  notificationAudio.pause();
+  notificationAudio.currentTime = 0;
 }
 
-ipcRenderer.on('mute-state-changed', (event, muted) => {
-  isMuted = muted;
-  if (isMuted && notificationAudio) {
-    notificationAudio.pause();
-    notificationAudio.currentTime = 0;
+function reloadNotificationAudio() {
+  stopNotificationSound();
+  if (notificationAudio) {
+    notificationAudio.removeAttribute('src');
+    notificationAudio.load();
+    notificationAudio = null;
   }
-});
-
-ipcRenderer.on('open-sound-picker', () => {
-  selectNotificationSound();
-});
-
-ipcRenderer.on('notification-sound-updated', () => {
-  reloadNotificationAudio();
-});
-
-function applyUnreadCount(rawCount, { silent = false, hasNewUnread = false } = {}) {
-  const count = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
-
-  if (!silent && unreadBaselineReady && hasNewUnread) {
-    playNotificationSound();
-  }
-
-  if (count !== lastUnreadCount) {
-    if (count > 0) {
-      const badge = createBadgeDataUrl(count);
-      if (badge) {
-        sendBadge(badge);
-        sendTrayBadge(badge);
-      }
-    } else {
-      sendBadge(null);
-      sendTrayBadge(null);
-    }
-    lastUnreadCount = count;
-  }
-
-  if (!unreadBaselineReady && unreadBaselineTimer === null) {
-    unreadBaselineTimer = setTimeout(() => {
-      unreadBaselineReady = true;
-      unreadBaselineTimer = null;
-    }, UNREAD_BASELINE_SETTLE_MS);
-  }
+  notificationAudioVersion += 1;
 }
 
-function effectiveUnreadCount() {
-  return domUnreadCount !== null ? domUnreadCount : titleUnreadCount;
+ipcRenderer.on('play-notification-sound', scheduleNotificationSound);
+ipcRenderer.on('stop-notification-sound', stopNotificationSound);
+ipcRenderer.on('notification-sound-updated', reloadNotificationAudio);
+
+let latestTitleHint = { available: false, count: 0 };
+let titleBaselineReady = false;
+let titleBaselineTimer = null;
+let notificationBaselineReady = false;
+let notificationBaselineTimer = null;
+let handleTitleHint = null;
+
+function startNotificationBaselineCapture() {
+  if (notificationBaselineReady || notificationBaselineTimer !== null) return;
+  notificationBaselineTimer = setTimeout(() => {
+    notificationBaselineTimer = null;
+    notificationBaselineReady = true;
+  }, TITLE_BASELINE_CAPTURE_MS);
 }
 
-function setDomUnreadCount(rawCount, options) {
-  domUnreadCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
-  applyUnreadCount(effectiveUnreadCount(), options);
-}
+ipcRenderer.on('title-unread-hint', (_event, rawHint) => {
+  const available = rawHint?.available === true;
+  const count = available
+    && Number.isSafeInteger(rawHint.count)
+    && rawHint.count >= 0
+    && rawHint.count <= 9999
+    ? rawHint.count
+    : 0;
+  const nextHint = { available, count };
+  const previousCount = latestTitleHint.available ? latestTitleHint.count : 0;
+  const notify = titleBaselineReady
+    && available
+    && count > previousCount;
 
-ipcRenderer.on('unread-count-changed', (event, rawCount) => {
-  titleUnreadCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
-  if (domUnreadCount === null) applyUnreadCount(effectiveUnreadCount());
+  latestTitleHint = nextHint;
+  if (!titleBaselineReady && titleBaselineTimer === null) {
+    startNotificationBaselineCapture();
+    // Capture startup hydration in one window anchored to the first value. Do
+    // not restart this timer on every title change.
+    titleBaselineTimer = setTimeout(() => {
+      titleBaselineTimer = null;
+      titleBaselineReady = true;
+    }, TITLE_BASELINE_CAPTURE_MS);
+  }
+  if (handleTitleHint) handleTitleHint(notify);
 });
 
 window.addEventListener('DOMContentLoaded', () => {
   const STORAGE_KEY = 'messenger-layout';
-  const NAV_SELECTOR = [
-    '[aria-label="Seznam konverzací"]',
-    '[aria-label="Conversation list"]',
-    '[aria-label="Chat list"]',
+  const VIEWPORT_INSET_PX = 5;
+  const MIN_CHAT_WIDTH_PX = 280;
+  const MAX_NAV_WIDTH_PX = 600;
+  const MAX_TRACKED_THREADS = 500;
+  const CROSS_SOURCE_NOTIFY_WINDOW_MS = 1000;
+  const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
+  const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
+  const COMPACT_CONTROL_SELECTOR = [
+    '[role="search"]',
+    'input',
+    'h1',
+    '[aria-label="Facebook"]',
+    '[aria-label="Nová zpráva"]',
+    '[aria-label="New message"]',
   ].join(', ');
-  const NAV_SEARCH_DEBOUNCE_MS = 250;
+  const MENU_CONTROL_SELECTOR = [
+    '[aria-label="Přepínač Doručených zpráv"]',
+    '[aria-label="Inbox switcher"]',
+  ].join(', ');
+  const SCOPED_CONTROL_SELECTOR = `${COMPACT_CONTROL_SELECTOR}, ${MENU_CONTROL_SELECTOR}`;
+  const MANAGED_STRUCTURE_ATTRIBUTES = new Set([
+    'data-messenger-app-custom-width',
+    'data-messenger-app-fill',
+    'data-messenger-app-global-banner',
+    'data-messenger-app-nav',
+    'data-messenger-app-nav-collapsed',
+    'data-messenger-app-relative-root',
+    'data-messenger-app-thread-fill',
+    'data-messenger-app-viewport-root',
+  ]);
+  const NAV_LABELS = new Set([
+    'conversation list',
+    'chat list',
+    'seznam konverzací',
+    'seznam konverzaci',
+  ]);
 
   const loadState = () => {
     try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch {
       return {};
     }
   };
 
   const saveState = (updates) => {
-    const state = { ...loadState(), ...updates };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...loadState(), ...updates }));
+    } catch {
+      // Storage can be unavailable on login/checkpoint pages.
+    }
   };
 
-  const clampWidth = (value, fallback = null) => {
-    if (value === null || value === undefined || value === '') return fallback;
+  const finiteWidth = (value, fallback) => {
     const width = Number(value);
-    return Number.isFinite(width) ? Math.max(0, Math.min(600, width)) : fallback;
+    return Number.isFinite(width)
+      ? Math.max(0, Math.min(MAX_NAV_WIDTH_PX, width))
+      : fallback;
   };
+
+  const viewportWidth = () => Math.max(0, window.visualViewport?.width || window.innerWidth || 0);
+  const viewportHeight = () => Math.max(0, window.visualViewport?.height || window.innerHeight || 0);
 
   const style = document.createElement('style');
-  style.id = 'custom-messenger-styles';
+  style.id = 'messenger-app-styles';
   style.textContent = `
     [data-testid="cookie-policy-manage-dialog"],
-    [role="banner"] {
+    [data-messenger-app-global-banner] {
       display: none !important;
     }
 
@@ -179,109 +187,81 @@ window.addEventListener('DOMContentLoaded', () => {
       background: rgba(255, 255, 255, 0.4);
     }
 
-    [data-messenger-app-nav][data-custom-width] {
-      width: var(--messenger-nav-width) !important;
-      min-width: var(--messenger-nav-width) !important;
-      max-width: var(--messenger-nav-width) !important;
-    }
-    [data-messenger-app-nav][data-nav-collapsed] {
+    [data-messenger-app-viewport-root] {
+      box-sizing: border-box !important;
+      top: var(--messenger-app-root-top, 0px) !important;
+      bottom: auto !important;
+      height: var(--messenger-app-viewport-height) !important;
+      min-height: 0 !important;
+      max-height: var(--messenger-app-viewport-height) !important;
       overflow: hidden !important;
     }
-
-    /* Reclaim the space reserved for Facebook's hidden global header.
-       Leave a tiny allowance for Meta's rounded/padded shell to avoid page overflow. */
-    [data-messenger-app-content-layer] {
-      height: calc(100vh - 5px) !important;
-      min-height: calc(100vh - 5px) !important;
+    [data-messenger-app-viewport-root][data-messenger-app-relative-root] {
+      position: relative !important;
     }
-    [data-messenger-app-content-offset] {
-      top: 0 !important;
-      bottom: 0 !important;
+    html.messenger-app-mounted,
+    body.messenger-app-mounted {
+      overflow: hidden !important;
     }
-    [data-messenger-app-thread-region] {
+    [data-messenger-app-fill] {
+      box-sizing: border-box !important;
       height: 100% !important;
+      min-height: 0 !important;
+    }
+    [data-messenger-app-thread-fill] {
+      box-sizing: border-box !important;
+      height: 100% !important;
+      min-height: 0 !important;
       max-height: none !important;
     }
-    [data-messenger-app-thread-limit] {
-      max-height: none !important;
-    }
 
-    body.messenger-compact [data-messenger-app-nav] {
-      width: var(--messenger-nav-width) !important;
-      min-width: var(--messenger-nav-width) !important;
-      max-width: var(--messenger-nav-width) !important;
-      overflow-x: hidden !important;
+    [data-messenger-app-nav][data-messenger-app-custom-width] {
+      width: var(--messenger-app-nav-width) !important;
+      min-width: var(--messenger-app-nav-width) !important;
+      max-width: var(--messenger-app-nav-width) !important;
     }
-    body.messenger-compact [data-messenger-app-nav] [role="search"],
-    body.messenger-compact [data-messenger-app-nav] input,
-    body.messenger-compact [data-messenger-app-nav] h1,
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Facebook"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Nová zpráva"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="New message"] {
-      display: none !important;
-    }
-    body.messenger-compact [data-messenger-app-nav] span:not([data-visualcompletion]):not([role]) {
-      font-size: 0 !important;
-      line-height: 0 !important;
-      height: 0 !important;
+    [data-messenger-app-nav][data-messenger-app-nav-collapsed] {
       overflow: hidden !important;
     }
-    body.messenger-compact [data-messenger-app-nav] img {
-      display: block !important;
-      visibility: visible !important;
-      opacity: 1 !important;
-    }
-    body.messenger-compact [data-messenger-app-nav] [role="button"] {
-      display: none !important;
-    }
-    body.messenger-compact [data-messenger-app-nav] > div > [role="button"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Chaty"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Chats"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Lidé"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="People"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Marketplace"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Žádosti o zprávy"],
-    body.messenger-compact [data-messenger-app-nav] [aria-label="Message requests"] {
-      display: flex !important;
-    }
 
-    body.messenger-menu-hidden [aria-label="Přepínač Doručených zpráv"],
-    body.messenger-menu-hidden [aria-label="Inbox switcher"] {
-      width: 0 !important;
-      min-width: 0 !important;
-      max-width: 0 !important;
-      overflow: hidden !important;
-      padding: 0 !important;
-      opacity: 0 !important;
-    }
-
-    .resize-handle {
+    [data-messenger-app-resize-handle] {
       position: fixed;
       top: 0;
       width: 8px;
-      height: 100vh;
+      height: var(--messenger-app-viewport-height, 100vh);
       cursor: col-resize;
-      z-index: 99999;
+      z-index: 2147483646;
       background: transparent;
-      transition: background 0.2s;
+      transition: background 0.15s;
       touch-action: none;
     }
-    .resize-handle:hover,
-    .resize-handle.active {
+    [data-messenger-app-resize-handle]:hover,
+    [data-messenger-app-resize-handle][data-active] {
       background: rgba(0, 149, 246, 0.4);
     }
-    body.resizing {
+    body.messenger-app-resizing,
+    body.messenger-app-resizing * {
       cursor: col-resize !important;
       user-select: none !important;
     }
-    body.resizing * {
-      cursor: col-resize !important;
-    }
 
-    body.messenger-compact .has-unread {
+    body.messenger-app-compact [data-messenger-app-nav] {
+      overflow-x: hidden !important;
+    }
+    body.messenger-app-compact [data-messenger-app-compact-hide],
+    body.messenger-app-menu-hidden [data-messenger-app-menu] {
+      display: none !important;
+    }
+    body.messenger-app-compact [data-messenger-app-compact-text] {
+      font-size: 0 !important;
+      line-height: 0 !important;
+      max-width: 0 !important;
+      overflow: hidden !important;
+    }
+    body.messenger-app-compact [data-messenger-app-unread] {
       position: relative !important;
     }
-    body.messenger-compact .has-unread::after {
+    body.messenger-app-compact [data-messenger-app-unread]::after {
       content: '';
       position: absolute;
       top: 4px;
@@ -289,315 +269,774 @@ window.addEventListener('DOMContentLoaded', () => {
       width: 12px;
       height: 12px;
       background: #ff3b30;
-      border-radius: 50%;
       border: 2px solid #242526;
-      z-index: 10;
+      border-radius: 50%;
       pointer-events: none;
+      z-index: 10;
     }
   `;
-  document.head.appendChild(style);
+  (document.head || document.documentElement).appendChild(style);
 
-  function findConversationList() {
-    const labelled = document.querySelector(NAV_SELECTOR);
-    if (labelled) return labelled;
+  const normalizeText = (value) => String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 
-    return Array.from(document.querySelectorAll('[role="navigation"]')).find((candidate) => (
-      candidate.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]')
-    )) || null;
+  const isElementStructurallyShown = (element) => {
+    if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
+      return false;
+    }
+    for (let node = element; node; node = node.parentElement) {
+      const computed = getComputedStyle(node);
+      if (computed.display === 'none'
+        || computed.visibility === 'hidden'
+        || computed.visibility === 'collapse') {
+        return false;
+      }
+      if (node === document.body) break;
+    }
+    return true;
+  };
+
+  const isElementVisible = (element, { allowZeroWidth = false } = {}) => {
+    if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    if ((!allowZeroWidth && rect.width <= 1) || rect.height <= 1) return false;
+    const width = viewportWidth();
+    const height = viewportHeight();
+    if (rect.bottom <= 0 || rect.top >= height) return false;
+    if (allowZeroWidth ? rect.right < 0 || rect.left > width : rect.right <= 0 || rect.left >= width) {
+      return false;
+    }
+    const computed = getComputedStyle(element);
+    return computed.display !== 'none'
+      && computed.visibility !== 'hidden'
+      && computed.visibility !== 'collapse';
+  };
+
+  const threadIdentity = (link) => {
+    const href = link?.getAttribute('href');
+    if (!href) return null;
+    try {
+      const url = new URL(href, window.location.href);
+      const match = /^\/messages\/(?:e2ee\/)?t\/([^/?#]+)/.exec(url.pathname);
+      return match ? decodeURIComponent(match[1]).slice(0, 256) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  function findVisibleConversationList() {
+    const candidates = new Set();
+    document.querySelectorAll('[aria-label], [role="navigation"]').forEach((candidate) => {
+      const label = normalizeText(candidate.getAttribute('aria-label'));
+      if (NAV_LABELS.has(label) || candidate.querySelector(THREAD_LINK_SELECTOR)) {
+        candidates.add(candidate);
+      }
+    });
+
+    let best = null;
+    let bestScore = -Infinity;
+    candidates.forEach((candidate) => {
+      const allowCollapsedActive = candidate === activeNav
+        && candidate.hasAttribute('data-messenger-app-nav-collapsed');
+      if (!isElementVisible(candidate, { allowZeroWidth: allowCollapsedActive })) return;
+      const rect = candidate.getBoundingClientRect();
+      const linkCount = candidate.querySelectorAll(THREAD_LINK_SELECTOR).length;
+      const labelled = NAV_LABELS.has(normalizeText(candidate.getAttribute('aria-label')));
+      const roleNavigation = candidate.getAttribute('role') === 'navigation';
+      const score = (labelled ? 100000 : 0)
+        + (roleNavigation ? 10000 : 0)
+        + Math.min(linkCount, 100) * 100
+        + Math.min(rect.width * rect.height, 1000000) / 1000;
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    });
+    return best;
   }
 
-  function setupFullHeightLayout(nav) {
-    const main = document.querySelector('[role="main"]');
-    if (!main) return () => {};
-
-    const mainAncestors = new Set();
-    for (let node = main; node; node = node.parentElement) mainAncestors.add(node);
-
-    let common = nav;
-    while (common && !mainAncestors.has(common)) common = common.parentElement;
-    if (!common) return () => {};
-
-    const layers = [];
-    for (let node = common; node && node !== document.body; node = node.parentElement) {
-      node.setAttribute('data-messenger-app-content-layer', '');
-      const top = Number.parseFloat(getComputedStyle(node).top);
-      if (Number.isFinite(top) && top > 0) {
-        node.setAttribute('data-messenger-app-content-offset', '');
+  function findVisibleMain(nav) {
+    let best = null;
+    let bestScore = -Infinity;
+    document.querySelectorAll('[role="main"]').forEach((candidate) => {
+      if (!isElementVisible(candidate) || candidate.contains(nav)) return;
+      const rect = candidate.getBoundingClientRect();
+      const editors = Array.from(candidate.querySelectorAll(EDITOR_SELECTOR))
+        .filter(isElementVisible).length;
+      const score = editors * 1000000
+        + Math.min(rect.width * rect.height, 4000000) / 1000
+        + (rect.left >= nav.getBoundingClientRect().left ? 1000 : 0);
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
       }
-      layers.push(node);
+    });
+    return best;
+  }
+
+  function lowestCommonAncestor(first, second) {
+    const ancestors = new Set();
+    for (let node = first; node; node = node.parentElement) ancestors.add(node);
+    for (let node = second; node; node = node.parentElement) {
+      if (ancestors.has(node)) return node;
+    }
+    return document.body;
+  }
+
+  const managedLayout = {
+    viewportRoot: null,
+    viewportRootNeedsRelativeOffset: false,
+    fillNodes: new Set(),
+    threadNodes: new Set(),
+    banners: new Set(),
+  };
+
+  const replaceManagedSet = (current, next, attribute) => {
+    current.forEach((node) => {
+      if (!next.has(node)) node.removeAttribute(attribute);
+    });
+    next.forEach((node) => node.setAttribute(attribute, ''));
+    current.clear();
+    next.forEach((node) => current.add(node));
+  };
+
+  const clearManagedLayout = () => {
+    if (managedLayout.viewportRoot) {
+      managedLayout.viewportRoot.removeAttribute('data-messenger-app-viewport-root');
+      managedLayout.viewportRoot.removeAttribute('data-messenger-app-relative-root');
+      managedLayout.viewportRoot.style.removeProperty('--messenger-app-viewport-height');
+      managedLayout.viewportRoot.style.removeProperty('--messenger-app-root-top');
+    }
+    managedLayout.viewportRoot = null;
+    managedLayout.viewportRootNeedsRelativeOffset = false;
+    replaceManagedSet(managedLayout.fillNodes, new Set(), 'data-messenger-app-fill');
+    replaceManagedSet(managedLayout.threadNodes, new Set(), 'data-messenger-app-thread-fill');
+    replaceManagedSet(managedLayout.banners, new Set(), 'data-messenger-app-global-banner');
+  };
+
+  function findGlobalBanners(nav, main) {
+    const next = new Set();
+    managedLayout.banners.forEach((banner) => {
+      if (banner.isConnected && !banner.contains(nav) && !banner.contains(main)) next.add(banner);
+    });
+
+    const facebookNavigation = Array.from(document.querySelectorAll('[role="navigation"][aria-label]'))
+      .find((candidate) => (
+        normalizeText(candidate.getAttribute('aria-label')) === 'facebook'
+        && !candidate.contains(nav)
+        && !candidate.contains(main)
+        && !nav.contains(candidate)
+        && !main.contains(candidate)
+      ));
+    if (facebookNavigation) {
+      next.add(facebookNavigation.closest('[role="banner"]') || facebookNavigation);
     }
 
-    const threadNodes = new Set();
-    let threadObserver = null;
-    let threadFrameId = null;
-
-    const applyThreadHeight = () => {
-      threadFrameId = null;
-      const editor = Array.from(main.querySelectorAll('[role="textbox"][contenteditable="true"]'))
-        .find((node) => node.getBoundingClientRect().width > 100);
-      if (!editor) return;
-
-      let threadRegion = null;
-      for (let node = editor; node && node !== main.parentElement; node = node.parentElement) {
-        const rect = node.getBoundingClientRect();
-        if (
-          node.getAttribute('role') === 'region'
-          && rect.height > window.innerHeight / 2
-          && getComputedStyle(node).maxHeight !== 'none'
-        ) {
-          threadRegion = node;
-        }
+    document.querySelectorAll('[role="banner"]').forEach((banner) => {
+      if (banner.contains(nav) || banner.contains(main) || nav.contains(banner) || main.contains(banner)) return;
+      const rect = banner.getBoundingClientRect();
+      if (isElementVisible(banner)
+        && rect.top <= 12
+        && rect.height >= 24
+        && rect.height <= 160
+        && rect.width >= viewportWidth() * 0.45) {
+        next.add(banner);
       }
-      if (!threadRegion) return;
-
-      const nextNodes = new Set();
-      for (let node = editor; node; node = node.parentElement) {
-        const rect = node.getBoundingClientRect();
-        if (rect.height > window.innerHeight / 2 && getComputedStyle(node).maxHeight !== 'none') {
-          node.setAttribute('data-messenger-app-thread-limit', '');
-          nextNodes.add(node);
-        }
-        if (node === threadRegion) break;
-      }
-
-      threadRegion.setAttribute('data-messenger-app-thread-region', '');
-      nextNodes.add(threadRegion);
-
-      threadNodes.forEach((node) => {
-        if (!nextNodes.has(node)) {
-          node.removeAttribute('data-messenger-app-thread-region');
-          node.removeAttribute('data-messenger-app-thread-limit');
-        }
-      });
-
-      threadNodes.clear();
-      nextNodes.forEach((node) => threadNodes.add(node));
-    };
-
-    const scheduleThreadHeight = () => {
-      if (threadFrameId === null) threadFrameId = requestAnimationFrame(applyThreadHeight);
-    };
-
-    applyThreadHeight();
-    threadObserver = new MutationObserver(scheduleThreadHeight);
-    threadObserver.observe(main, { childList: true, subtree: true });
-
-    return () => {
-      if (threadObserver) threadObserver.disconnect();
-      if (threadFrameId !== null) cancelAnimationFrame(threadFrameId);
-      threadNodes.forEach((node) => {
-        node.removeAttribute('data-messenger-app-thread-region');
-        node.removeAttribute('data-messenger-app-thread-limit');
-      });
-      layers.forEach((node) => {
-        node.removeAttribute('data-messenger-app-content-layer');
-        node.removeAttribute('data-messenger-app-content-offset');
-      });
-    };
+    });
+    return next;
   }
 
-  function setupUnreadTracker(nav, onUpdate) {
-    let frameId = null;
-    let lastReported = -1;
-    const pendingLinks = new Set();
+  function findVisibleEditor(main) {
+    let best = null;
+    let bestScore = -Infinity;
+    main.querySelectorAll(EDITOR_SELECTOR).forEach((editor) => {
+      if (!isElementVisible(editor)) return;
+      const rect = editor.getBoundingClientRect();
+      const score = rect.width * 10 + rect.bottom;
+      if (rect.width > 100 && score > bestScore) {
+        best = editor;
+        bestScore = score;
+      }
+    });
+    return best;
+  }
+
+  function findThreadFillNodes(main) {
+    const editor = findVisibleEditor(main);
+    if (!editor) return new Set();
+
+    const minimumHeight = viewportHeight() * 0.35;
+    let region = null;
+    let regionArea = -1;
+    main.querySelectorAll('[role="region"]').forEach((candidate) => {
+      if (!candidate.contains(editor) || !isElementVisible(candidate)) return;
+      const rect = candidate.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (rect.height >= minimumHeight && area > regionArea) {
+        region = candidate;
+        regionArea = area;
+      }
+    });
+
+    const boundary = region || main;
+    const next = new Set();
+    for (let node = editor.parentElement; node && main.contains(node); node = node.parentElement) {
+      const rect = node.getBoundingClientRect();
+      if (node === boundary || rect.height >= minimumHeight) next.add(node);
+      if (node === boundary || node === main) break;
+    }
+    if (region) next.add(region);
+    return next;
+  }
+
+  function applyManagedLayout(nav, main) {
+    const root = lowestCommonAncestor(nav, main) || document.body;
+    const height = Math.max(0, viewportHeight() - VIEWPORT_INSET_PX);
+
+    if (managedLayout.viewportRoot && managedLayout.viewportRoot !== root) {
+      managedLayout.viewportRoot.removeAttribute('data-messenger-app-viewport-root');
+      managedLayout.viewportRoot.removeAttribute('data-messenger-app-relative-root');
+      managedLayout.viewportRoot.style.removeProperty('--messenger-app-viewport-height');
+      managedLayout.viewportRoot.style.removeProperty('--messenger-app-root-top');
+    }
+    managedLayout.viewportRoot = root;
+
+    // Temporarily expose the host page's native positioning, then apply a
+    // stable offset. This handles both absolute shells with top:56px and
+    // relatively positioned Meta shells whose normal flow shifts after the
+    // global header is hidden.
+    root.removeAttribute('data-messenger-app-viewport-root');
+    root.removeAttribute('data-messenger-app-relative-root');
+    const nativePosition = getComputedStyle(root).position;
+    const nativeTop = root.getBoundingClientRect().top;
+    root.setAttribute('data-messenger-app-viewport-root', '');
+    const needsRelativeOffset = nativePosition === 'static' || nativePosition === 'relative';
+    managedLayout.viewportRootNeedsRelativeOffset = needsRelativeOffset;
+    root.toggleAttribute('data-messenger-app-relative-root', needsRelativeOffset);
+    const rootTopValue = needsRelativeOffset ? `${-nativeTop}px` : '0px';
+    if (root.style.getPropertyValue('--messenger-app-root-top') !== rootTopValue) {
+      root.style.setProperty('--messenger-app-root-top', rootTopValue);
+    }
+    const heightValue = `${height}px`;
+    if (root.style.getPropertyValue('--messenger-app-viewport-height') !== heightValue) {
+      root.style.setProperty('--messenger-app-viewport-height', heightValue);
+    }
+
+    const fillNodes = new Set();
+    for (const endpoint of [nav, main]) {
+      for (let node = endpoint; node && node !== root; node = node.parentElement) {
+        fillNodes.add(node);
+      }
+    }
+    replaceManagedSet(managedLayout.fillNodes, fillNodes, 'data-messenger-app-fill');
+    // Measure native Meta geometry, not the geometry produced by our previous
+    // height override. Attribute removal/reapply occurs in one task, before paint.
+    managedLayout.threadNodes.forEach((node) => {
+      node.removeAttribute('data-messenger-app-thread-fill');
+    });
+    replaceManagedSet(managedLayout.threadNodes, findThreadFillNodes(main), 'data-messenger-app-thread-fill');
+    replaceManagedSet(
+      managedLayout.banners,
+      findGlobalBanners(nav, main),
+      'data-messenger-app-global-banner',
+    );
+  }
+
+  function rowHasUnread(link) {
+    const candidates = [link, ...link.querySelectorAll('[aria-label], [data-testid], [data-unread]')];
+    for (const candidate of candidates.slice(0, 96)) {
+      if (candidate.getAttribute('data-unread') === 'true') return true;
+      const testId = normalizeText(candidate.getAttribute('data-testid')).replace(/[-_]+/g, ' ');
+      const label = normalizeText(candidate.getAttribute('aria-label'));
+      const semantics = `${testId} ${label}`.trim();
+      if (semantics.includes('mark unread')
+        || semantics.includes('mark as unread')
+        || semantics.includes('oznacit jako neprectene')) {
+        continue;
+      }
+      if (/(^| )unread($| )/.test(testId)) return true;
+      if (!label) continue;
+      if (label.includes('mark as read')
+        || label.includes('oznacit jako prectene')
+        || /(^|\b)unread(?: message)?(\b|$)/.test(label)
+        || label.includes('neprectena zprava')
+        || label.includes('neprectene zpravy')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const isVolatileRowText = (text) => {
+    const normalized = normalizeText(text);
+    return !normalized
+      || /^(?:now|ted|today|dnes|yesterday|vcera)$/.test(normalized)
+      || /^(?:\d{1,2}:\d{2}|(?:pred\s+)?\d+\s*(?:s|sec|m|min|h|hr|d|day|days|w|week|weeks|tyd|hod)(?:\s+(?:ago|zpet))?)$/.test(normalized)
+      || /^(?:active|aktivni|aktivni pred)\b/.test(normalized)
+      || /^(?:.{1,80}\s+)?(?:(?:is|are)\s+typing|typing|pise|pisou)(?:\s*(?:\.{3}|…))?$/.test(normalized)
+      || /^(?:sent|seen|delivered|odeslano|zobrazeno|doruceno)$/.test(normalized)
+      || /^(?:mark|oznacit)\b.*(?:read|precten)/.test(normalized);
+  };
+
+  function rowSignature(link) {
+    const parts = [];
+    link.querySelectorAll('[dir="auto"]').forEach((node) => {
+      if (node.querySelector('[dir="auto"]')) return;
+      const text = normalizeText(node.textContent);
+      if (text && !isVolatileRowText(text)) parts.push(text);
+    });
+
+    if (parts.length === 0) {
+      const linkLabel = link.getAttribute('aria-label');
+      const text = normalizeText(linkLabel || link.innerText || link.textContent);
+      if (text) parts.push(text);
+    }
+    return parts.join('\u001f').slice(0, 1024);
+  }
+
+  function markCompactRow(link) {
+    link.querySelectorAll('[dir="auto"]').forEach((node) => {
+      if (!node.querySelector('img, svg')) node.setAttribute('data-messenger-app-compact-text', '');
+    });
+  }
+
+  function setupUnreadTracker(nav, onSnapshot) {
     const threadState = new Map();
+    const linkIdentity = new WeakMap();
+    const dirtyIds = new Set();
+    const notificationEligibleIds = new Set();
+    const pendingNotifications = new Map();
+    const identityRefreshState = new WeakMap();
+    const identityRefreshStates = new Set();
+    const SIGNATURE_STABILITY_MS = 180;
+    const IDENTITY_REFRESH_QUIET_MS = 750;
+    let flushScheduled = false;
+    let disposed = false;
+    let lastReportedCount = null;
 
-    const threadIdentity = (link) => {
-      const href = link.getAttribute('href');
-      if (!href) return null;
-      const match = href.match(/\/messages\/(?:e2ee\/)?t\/[^/?#]+/);
-      return match ? match[0] : null;
+    const currentCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.unread) count += 1;
+      });
+      return Math.min(count, 9999);
     };
 
-    const collectLinks = (node, includeDescendants = false) => {
-      const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const touchState = (id, value) => {
+      threadState.delete(id);
+      threadState.set(id, value);
+      while (threadState.size > MAX_TRACKED_THREADS) {
+        const evictedId = threadState.keys().next().value;
+        const pending = pendingNotifications.get(evictedId);
+        if (pending) clearTimeout(pending.timer);
+        pendingNotifications.delete(evictedId);
+        threadState.delete(evictedId);
+      }
+    };
+
+    const cancelPendingNotification = (id) => {
+      const pending = pendingNotifications.get(id);
+      if (pending) clearTimeout(pending.timer);
+      pendingNotifications.delete(id);
+    };
+
+    const signatureIsSubstantive = (signature) => signature.includes('\u001f');
+
+    const scheduleStableNotification = (id, signature) => {
+      cancelPendingNotification(id);
+      const timer = setTimeout(() => {
+        pendingNotifications.delete(id);
+        const current = threadState.get(id);
+        if (!current?.unread || current.signature !== signature) return;
+        onSnapshot({ count: currentCount(), notify: true });
+      }, SIGNATURE_STABILITY_MS);
+      pendingNotifications.set(id, { signature, timer });
+    };
+
+    const markDirty = (id, { notificationEligible = false } = {}) => {
+      if (!id) return;
+      dirtyIds.add(id);
+      if (notificationEligible) notificationEligibleIds.add(id);
+    };
+
+    const rememberLink = (link, reasons) => {
+      if (!(link instanceof Element) || !link.matches(THREAD_LINK_SELECTOR)) return;
+      const previousId = linkIdentity.get(link);
+      const nextId = threadIdentity(link);
+      if (previousId) markDirty(previousId, reasons);
+      if (nextId) {
+        markDirty(nextId, reasons);
+        linkIdentity.set(link, nextId);
+      } else {
+        linkIdentity.delete(link);
+      }
+    };
+
+    const collectLinks = (node, includeDescendants, reasons) => {
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
       if (!element) return;
-
-      const closestLink = element.closest('a');
-      if (closestLink && nav.contains(closestLink)) pendingLinks.add(closestLink);
+      const closest = element.closest?.(THREAD_LINK_SELECTOR);
+      if (closest && nav.contains(closest)) rememberLink(closest, reasons);
       if (includeDescendants && element.querySelectorAll) {
-        element.querySelectorAll('a').forEach((link) => {
-          if (nav.contains(link)) pendingLinks.add(link);
-        });
+        if (element.matches?.(THREAD_LINK_SELECTOR)) rememberLink(element, reasons);
+        element.querySelectorAll(THREAD_LINK_SELECTOR).forEach((link) => rememberLink(link, reasons));
       }
     };
 
-    const linkHasUnread = (link) => {
-      for (const span of link.querySelectorAll('span[dir="auto"]')) {
-        const fontWeight = Number.parseInt(getComputedStyle(span).fontWeight, 10);
-        if (fontWeight >= 600) return true;
-      }
-      return false;
-    };
-
-    const updateLink = (link) => {
-      if (!link.isConnected) return;
-      link.classList.toggle('has-unread', linkHasUnread(link));
-    };
-
-    const reportCount = (hasNewUnread) => {
-      const count = nav.querySelectorAll(
-        'a[href*="/messages/t/"].has-unread, a[href*="/messages/e2ee/t/"].has-unread',
-      ).length;
-      if (count === lastReported && !hasNewUnread) return;
-      lastReported = count;
-      onUpdate(count, hasNewUnread);
+    const markRemovedLinks = (node) => {
+      if (node?.nodeType !== Node.ELEMENT_NODE) return;
+      const links = [];
+      if (node.matches?.(THREAD_LINK_SELECTOR)) links.push(node);
+      node.querySelectorAll?.(THREAD_LINK_SELECTOR).forEach((link) => links.push(link));
+      links.forEach((link) => {
+        const id = linkIdentity.get(link) || threadIdentity(link);
+        if (id) markDirty(id);
+      });
     };
 
     const flush = () => {
-      frameId = null;
-      const links = Array.from(pendingLinks);
-      pendingLinks.clear();
-      links.forEach(updateLink);
-
-      let hasNewUnread = false;
-      for (const link of links) {
-        if (!link.isConnected) continue;
+      flushScheduled = false;
+      if (disposed) return;
+      const groups = new Map();
+      nav.querySelectorAll(THREAD_LINK_SELECTOR).forEach((link) => {
         const id = threadIdentity(link);
-        if (!id) continue;
-        const isUnread = link.classList.contains('has-unread');
-        const prev = threadState.get(id);
-        if (prev === undefined) {
-          threadState.set(id, isUnread);
-        } else if (prev !== isUnread) {
-          threadState.set(id, isUnread);
-          if (isUnread) hasNewUnread = true;
-        }
-      }
+        if (!id) return;
+        linkIdentity.set(link, id);
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id).push(link);
+      });
 
-      reportCount(hasNewUnread);
+      for (const id of dirtyIds) {
+        const allLinks = groups.get(id);
+        if (!allLinks?.length) {
+          cancelPendingNotification(id);
+          continue;
+        }
+        const visibleLinks = allLinks.filter(isElementVisible);
+        const links = visibleLinks.length > 0 ? visibleLinks : allLinks;
+        const unreadLinks = links.filter(rowHasUnread);
+        allLinks.forEach((link) => {
+          const unread = rowHasUnread(link);
+          link.toggleAttribute('data-messenger-app-unread', unread);
+          markCompactRow(link);
+        });
+
+        const unread = unreadLinks.length > 0;
+        const signature = unread
+          ? [...new Set(unreadLinks.map(rowSignature).filter(Boolean))].sort().join('\u001e').slice(0, 2048)
+          : '';
+        const previous = threadState.get(id);
+        const notificationEligible = notificationEligibleIds.has(id);
+        const substantiveSignature = unread && signatureIsSubstantive(signature);
+        let stable = !unread || substantiveSignature;
+        let pendingUnreadTransition = false;
+        if (previous) {
+          if (!unread) {
+            cancelPendingNotification(id);
+          } else if (!previous.unread && notificationEligible) {
+            pendingUnreadTransition = true;
+            if (substantiveSignature) {
+              scheduleStableNotification(id, signature);
+              pendingUnreadTransition = false;
+            }
+          } else if (previous.unread && unread) {
+            pendingUnreadTransition = previous.pendingUnreadTransition === true;
+            const changedSignature = previous.signature
+              && signature
+              && previous.signature !== signature;
+            if (!previous.stable) {
+              if (substantiveSignature) {
+                // The first complete preview after an initial skeleton is part
+                // of baseline hydration. Only a prior read->unread transition
+                // may turn it into a notification.
+                if (pendingUnreadTransition) scheduleStableNotification(id, signature);
+                pendingUnreadTransition = false;
+              } else {
+                cancelPendingNotification(id);
+              }
+            } else if (changedSignature && notificationEligible && substantiveSignature) {
+              scheduleStableNotification(id, signature);
+            } else if (changedSignature && !substantiveSignature) {
+              // Ignore temporary name-only/empty hydration states and wait for
+              // the final preview before deciding.
+              cancelPendingNotification(id);
+            }
+            stable = previous.stable || substantiveSignature;
+          }
+        }
+        touchState(id, {
+          unread,
+          signature,
+          stable,
+          pendingUnreadTransition,
+        });
+      }
+      dirtyIds.clear();
+      notificationEligibleIds.clear();
+
+      const count = currentCount();
+      if (count !== lastReportedCount) {
+        lastReportedCount = count;
+        onSnapshot({ count, notify: false });
+      }
     };
 
     const scheduleFlush = () => {
-      if (frameId === null && pendingLinks.size > 0) {
-        frameId = requestAnimationFrame(flush);
+      if (flushScheduled || dirtyIds.size === 0) return;
+      flushScheduled = true;
+      queueMicrotask(flush);
+    };
+
+    const refreshIdentityHydration = (link) => {
+      let state = identityRefreshState.get(link);
+      if (!state) {
+        state = { active: true, timer: null };
+        identityRefreshState.set(link, state);
+        identityRefreshStates.add(state);
       }
+      state.active = true;
+      if (state.timer !== null) clearTimeout(state.timer);
+      state.timer = setTimeout(() => {
+        state.active = false;
+        state.timer = null;
+        identityRefreshStates.delete(state);
+        identityRefreshState.delete(link);
+      }, IDENTITY_REFRESH_QUIET_MS);
+    };
+
+    const closestTrackedAnchor = (node) => {
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+      const anchor = element?.tagName === 'A' ? element : element?.closest?.('a');
+      return anchor && nav.contains(anchor) ? anchor : null;
     };
 
     const observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
-        if (mutation.type === 'attributes' && mutation.target === nav && mutation.attributeName === 'style') {
-          continue;
+        if (mutation.type !== 'attributes' || mutation.attributeName !== 'href') continue;
+        const link = closestTrackedAnchor(mutation.target);
+        if (!link) continue;
+        const previousId = linkIdentity.get(link);
+        const nextId = threadIdentity(link);
+        if (!previousId && !nextId) continue;
+        refreshIdentityHydration(link);
+        if (previousId) {
+          cancelPendingNotification(previousId);
+          markDirty(previousId);
         }
+        if (nextId) {
+          cancelPendingNotification(nextId);
+          markDirty(nextId);
+        } else {
+          linkIdentity.delete(link);
+        }
+      }
 
-        collectLinks(mutation.target);
-        for (const node of mutation.addedNodes) collectLinks(node, true);
+      const isIdentityRefreshMutation = (mutation) => {
+        const link = closestTrackedAnchor(mutation.target);
+        const state = link ? identityRefreshState.get(link) : null;
+        if (!state?.active) return false;
+        refreshIdentityHydration(link);
+        return true;
+      };
+
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes') {
+          const visibilityOnly = ['aria-hidden', 'class', 'hidden', 'style'].includes(mutation.attributeName);
+          collectLinks(
+            mutation.target,
+            visibilityOnly && mutation.target !== nav,
+            { notificationEligible: !visibilityOnly && !isIdentityRefreshMutation(mutation) },
+          );
+        } else if (mutation.type === 'characterData') {
+          collectLinks(mutation.target, false, {
+            notificationEligible: !isIdentityRefreshMutation(mutation),
+          });
+        } else if (mutation.type === 'childList') {
+          collectLinks(mutation.target, false, {
+            notificationEligible: !isIdentityRefreshMutation(mutation),
+          });
+          mutation.addedNodes.forEach((node) => {
+            collectLinks(node, true, { notificationEligible: false });
+          });
+          mutation.removedNodes.forEach(markRemovedLinks);
+        }
       }
       scheduleFlush();
     });
 
     observer.observe(nav, {
       attributes: true,
-      attributeFilter: ['class', 'style', 'aria-label'],
+      attributeFilter: [
+        'aria-hidden',
+        'aria-label',
+        'class',
+        'data-testid',
+        'data-unread',
+        'hidden',
+        'href',
+        'style',
+      ],
       childList: true,
       characterData: true,
       subtree: true,
     });
 
-    nav.querySelectorAll('a').forEach((link) => pendingLinks.add(link));
+    nav.querySelectorAll(THREAD_LINK_SELECTOR).forEach((link) => rememberLink(link));
     flush();
 
     return {
       cleanup() {
+        disposed = true;
         observer.disconnect();
-        if (frameId !== null) cancelAnimationFrame(frameId);
-        frameId = null;
-        pendingLinks.clear();
-        nav.querySelectorAll('.has-unread').forEach((link) => link.classList.remove('has-unread'));
+        nav.querySelectorAll('[data-messenger-app-unread]').forEach((node) => {
+          node.removeAttribute('data-messenger-app-unread');
+        });
+        nav.querySelectorAll('[data-messenger-app-compact-text]').forEach((node) => {
+          node.removeAttribute('data-messenger-app-compact-text');
+        });
+        dirtyIds.clear();
+        notificationEligibleIds.clear();
+        pendingNotifications.forEach(({ timer }) => clearTimeout(timer));
+        pendingNotifications.clear();
+        identityRefreshStates.forEach(({ timer }) => {
+          if (timer !== null) clearTimeout(timer);
+        });
+        identityRefreshStates.clear();
+        threadState.clear();
       },
     };
   }
 
-  function setupNavResize(nav, saved) {
-    nav.setAttribute('data-messenger-app-nav', '');
+  function markScopedNavControls(nav) {
+    const syncAttribute = (selector, attribute) => {
+      const desired = new Set(nav.querySelectorAll(selector));
+      nav.querySelectorAll(`[${attribute}]`).forEach((node) => {
+        if (!desired.has(node)) node.removeAttribute(attribute);
+      });
+      desired.forEach((node) => {
+        if (!node.hasAttribute(attribute)) node.setAttribute(attribute, '');
+      });
+    };
+    syncAttribute(COMPACT_CONTROL_SELECTOR, 'data-messenger-app-compact-hide');
+    syncAttribute(MENU_CONTROL_SELECTOR, 'data-messenger-app-menu');
+  }
 
-    let isCompact = !!saved.isCompact;
-    let compactWidth = clampWidth(saved.compactWidth, 108);
-    let normalWidth = clampWidth(saved.navWidth);
-    let pendingWidth = null;
+  function setupNavControls(nav, saved, onLayoutChange) {
+    nav.setAttribute('data-messenger-app-nav', '');
+    markScopedNavControls(nav);
+
+    const measuredWidth = Math.max(0, nav.getBoundingClientRect().width);
+    let isCompact = saved.isCompact === true;
+    let menuHidden = saved.menuHidden === true;
+    let normalPreferred = finiteWidth(
+      saved.navWidth,
+      measuredWidth >= 48 ? finiteWidth(measuredWidth, 320) : 320,
+    );
+    let compactPreferred = finiteWidth(saved.compactWidth, 108);
+    let activePointerId = null;
+    let isDragging = false;
+    let startX = 0;
+    let startPreferred = 0;
+    let startAppliedWidth = 0;
+    let pendingPreferred = null;
+    let dragChanged = false;
     let resizeFrameId = null;
     let positionFrameId = null;
-    let startX = 0;
-    let startWidth = 0;
-    let isDragging = false;
-    let activePointerId = null;
 
     const handle = document.createElement('div');
-    handle.className = 'resize-handle';
+    handle.setAttribute('data-messenger-app-resize-handle', '');
+    handle.setAttribute('role', 'separator');
+    handle.setAttribute('aria-orientation', 'vertical');
+    handle.setAttribute('aria-label', 'Změnit šířku seznamu konverzací');
     document.body.appendChild(handle);
 
-    const applyWidth = (width) => {
-      if (width === null) {
-        nav.style.removeProperty('--messenger-nav-width');
-        nav.removeAttribute('data-custom-width');
-        nav.removeAttribute('data-nav-collapsed');
-        return;
+    const maxAllowedWidth = () => Math.max(
+      0,
+      Math.min(MAX_NAV_WIDTH_PX, viewportWidth() - MIN_CHAT_WIDTH_PX),
+    );
+
+    const currentPreferred = () => (isCompact ? compactPreferred : normalPreferred);
+
+    const applyPreferredWidth = (preferred = currentPreferred()) => {
+      const actual = Math.max(0, Math.min(maxAllowedWidth(), preferred));
+      const widthValue = `${actual}px`;
+      if (nav.style.getPropertyValue('--messenger-app-nav-width') !== widthValue) {
+        nav.style.setProperty('--messenger-app-nav-width', widthValue);
       }
-
-      nav.style.setProperty('--messenger-nav-width', `${width}px`);
-      nav.setAttribute('data-custom-width', '');
-      nav.toggleAttribute('data-nav-collapsed', width < 10);
-    };
-
-    const applyCurrentMode = () => {
-      document.body.classList.toggle('messenger-compact', isCompact);
-      applyWidth(isCompact ? compactWidth : normalWidth);
+      nav.setAttribute('data-messenger-app-custom-width', '');
+      nav.toggleAttribute('data-messenger-app-nav-collapsed', actual < 10);
+      return actual;
     };
 
     const updateHandlePosition = () => {
       positionFrameId = null;
-      if (!nav.isConnected) {
+      if (!nav.isConnected || !isElementVisible(nav, { allowZeroWidth: true })) {
         handle.hidden = true;
         return;
       }
-
       handle.hidden = false;
       const rect = nav.getBoundingClientRect();
-      handle.style.left = `${rect.right - 4}px`;
+      const left = Math.max(0, Math.min(viewportWidth() - 8, rect.right - 4));
+      handle.style.left = `${left}px`;
+      handle.style.setProperty('--messenger-app-viewport-height', `${Math.max(0, viewportHeight() - VIEWPORT_INSET_PX)}px`);
     };
 
     const scheduleHandlePosition = () => {
-      if (positionFrameId === null) {
-        positionFrameId = requestAnimationFrame(updateHandlePosition);
-      }
+      if (positionFrameId === null) positionFrameId = requestAnimationFrame(updateHandlePosition);
+    };
+
+    const applyMode = () => {
+      document.body.classList.toggle('messenger-app-compact', isCompact);
+      document.body.classList.toggle('messenger-app-menu-hidden', menuHidden);
+      applyPreferredWidth();
+      scheduleHandlePosition();
     };
 
     const flushResize = () => {
       resizeFrameId = null;
-      if (pendingWidth === null) return;
-      applyWidth(pendingWidth);
-      pendingWidth = null;
-    };
-
-    const scheduleResize = () => {
-      if (resizeFrameId === null) resizeFrameId = requestAnimationFrame(flushResize);
+      if (pendingPreferred === null) return;
+      applyPreferredWidth(pendingPreferred);
+      pendingPreferred = null;
+      scheduleHandlePosition();
     };
 
     const onPointerMove = (event) => {
-      if (event.pointerId !== activePointerId) return;
-      pendingWidth = clampWidth(startWidth + event.clientX - startX, startWidth);
-      scheduleResize();
+      if (!isDragging || event.pointerId !== activePointerId) return;
+      dragChanged = true;
+      pendingPreferred = finiteWidth(startPreferred + event.clientX - startX, startPreferred);
+      if (resizeFrameId === null) resizeFrameId = requestAnimationFrame(flushResize);
     };
 
     const finishResize = (event) => {
       if (!isDragging) return;
       if (event?.pointerId !== undefined && event.pointerId !== activePointerId) return;
-      isDragging = false;
-
       if (resizeFrameId !== null) cancelAnimationFrame(resizeFrameId);
       resizeFrameId = null;
-      if (pendingWidth !== null) flushResize();
+      if (pendingPreferred !== null) flushResize();
 
-      const finalWidth = clampWidth(
-        Number.parseFloat(nav.style.getPropertyValue('--messenger-nav-width')),
-        startWidth,
-      );
-      if (isCompact) compactWidth = finalWidth;
-      else normalWidth = finalWidth;
+      if (dragChanged) {
+        const applied = finiteWidth(
+          Number.parseFloat(nav.style.getPropertyValue('--messenger-app-nav-width')),
+          currentPreferred(),
+        );
+        if (Math.abs(applied - startAppliedWidth) > 0.5) {
+          if (isCompact) compactPreferred = applied;
+          else normalPreferred = applied;
+          saveState(isCompact ? { compactWidth: compactPreferred } : { navWidth: normalPreferred });
+        } else {
+          applyPreferredWidth();
+        }
+      }
 
-      saveState(isCompact ? { compactWidth } : { navWidth: normalWidth });
-      handle.classList.remove('active');
-      document.body.classList.remove('resizing');
+      isDragging = false;
+      handle.removeAttribute('data-active');
+      document.body.classList.remove('messenger-app-resizing');
       handle.removeEventListener('pointermove', onPointerMove);
       handle.removeEventListener('pointerup', finishResize);
       handle.removeEventListener('pointercancel', finishResize);
@@ -614,14 +1053,15 @@ window.addEventListener('DOMContentLoaded', () => {
       if (event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-
       startX = event.clientX;
-      startWidth = nav.getBoundingClientRect().width;
-      pendingWidth = startWidth;
+      startAppliedWidth = nav.getBoundingClientRect().width;
+      startPreferred = startAppliedWidth;
+      pendingPreferred = null;
+      dragChanged = false;
       isDragging = true;
       activePointerId = event.pointerId;
-      handle.classList.add('active');
-      document.body.classList.add('resizing');
+      handle.setAttribute('data-active', '');
+      document.body.classList.add('messenger-app-resizing');
       handle.setPointerCapture(activePointerId);
       handle.addEventListener('pointermove', onPointerMove);
       handle.addEventListener('pointerup', finishResize);
@@ -630,142 +1070,414 @@ window.addEventListener('DOMContentLoaded', () => {
       window.addEventListener('blur', finishResize);
     };
 
-    const setCompact = (compact) => {
-      if (compact === isCompact) return;
-      isCompact = compact;
-      saveState({ isCompact });
-      applyCurrentMode();
-      scheduleHandlePosition();
-    };
-
     const onKeyDown = (event) => {
-      if (event.ctrlKey && event.key.toLowerCase() === 'b') {
+      if (!event.ctrlKey || event.altKey || event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === 'b' && !event.shiftKey) {
         event.preventDefault();
-        setCompact(!isCompact);
-      }
-    };
-
-    const resizeObserver = new ResizeObserver(scheduleHandlePosition);
-    resizeObserver.observe(nav);
-    handle.addEventListener('pointerdown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    window.addEventListener('resize', scheduleHandlePosition, { passive: true });
-    applyCurrentMode();
-    scheduleHandlePosition();
-
-    return {
-      refreshHandlePosition: scheduleHandlePosition,
-      cleanup() {
-        if (isDragging) finishResize();
-        resizeObserver.disconnect();
-        if (resizeFrameId !== null) cancelAnimationFrame(resizeFrameId);
-        if (positionFrameId !== null) cancelAnimationFrame(positionFrameId);
-        handle.removeEventListener('pointerdown', onPointerDown);
-        document.removeEventListener('keydown', onKeyDown);
-        window.removeEventListener('resize', scheduleHandlePosition);
-        handle.remove();
-        nav.removeAttribute('data-messenger-app-nav');
-        document.body.classList.remove('resizing');
-      },
-    };
-  }
-
-  function setupMenuToggle(saved, onLayoutChange) {
-    let menuHidden = !!saved.menuHidden;
-    document.body.classList.toggle('messenger-menu-hidden', menuHidden);
-
-    const onKeyDown = (event) => {
-      if (event.ctrlKey && event.key.toLowerCase() === 'm') {
+        isCompact = !isCompact;
+        saveState({ isCompact });
+        applyMode();
+        onLayoutChange();
+      } else if (key === 'm' && !event.shiftKey) {
         event.preventDefault();
         menuHidden = !menuHidden;
         saveState({ menuHidden });
-        document.body.classList.toggle('messenger-menu-hidden', menuHidden);
+        applyMode();
         onLayoutChange();
       }
     };
 
+    const resizeObserver = new ResizeObserver(scheduleHandlePosition);
+    const controlObserver = new MutationObserver((mutations) => {
+      const containsControlCandidate = (node) => node?.nodeType === Node.ELEMENT_NODE
+        && (node.matches(SCOPED_CONTROL_SELECTOR)
+          || node.querySelector?.(SCOPED_CONTROL_SELECTOR));
+      let needsRefresh = false;
+      for (const mutation of mutations) {
+        const target = mutation.target.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target.parentElement;
+        if (mutation.type === 'attributes') {
+          if (mutation.attributeName === 'data-messenger-app-compact-hide') {
+            if (target.matches(COMPACT_CONTROL_SELECTOR)
+              && !target.hasAttribute('data-messenger-app-compact-hide')) {
+              needsRefresh = true;
+              break;
+            }
+            continue;
+          }
+          if (mutation.attributeName === 'data-messenger-app-menu') {
+            if (target.matches(MENU_CONTROL_SELECTOR)
+              && !target.hasAttribute('data-messenger-app-menu')) {
+              needsRefresh = true;
+              break;
+            }
+            continue;
+          }
+          if (target.matches(SCOPED_CONTROL_SELECTOR)
+            || target.hasAttribute('data-messenger-app-compact-hide')
+            || target.hasAttribute('data-messenger-app-menu')) {
+            needsRefresh = true;
+            break;
+          }
+        } else if (target?.matches?.(SCOPED_CONTROL_SELECTOR)
+          || [...mutation.addedNodes, ...mutation.removedNodes].some(containsControlCandidate)) {
+          needsRefresh = true;
+          break;
+        }
+      }
+      if (needsRefresh) markScopedNavControls(nav);
+    });
+    resizeObserver.observe(nav);
+    controlObserver.observe(nav, {
+      attributes: true,
+      attributeFilter: [
+        'aria-label',
+        'data-messenger-app-compact-hide',
+        'data-messenger-app-menu',
+        'role',
+      ],
+      childList: true,
+      subtree: true,
+    });
+    handle.addEventListener('pointerdown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
+    applyMode();
+
+    return {
+      refresh() {
+        if (!nav.hasAttribute('data-messenger-app-nav')) {
+          nav.setAttribute('data-messenger-app-nav', '');
+        }
+        markScopedNavControls(nav);
+        applyPreferredWidth();
+        scheduleHandlePosition();
+      },
+      cleanup() {
+        if (isDragging) finishResize();
+        resizeObserver.disconnect();
+        controlObserver.disconnect();
+        if (resizeFrameId !== null) cancelAnimationFrame(resizeFrameId);
+        if (positionFrameId !== null) cancelAnimationFrame(positionFrameId);
+        handle.removeEventListener('pointerdown', onPointerDown);
+        document.removeEventListener('keydown', onKeyDown);
+        handle.remove();
+        nav.style.removeProperty('--messenger-app-nav-width');
+        nav.removeAttribute('data-messenger-app-nav');
+        nav.removeAttribute('data-messenger-app-custom-width');
+        nav.removeAttribute('data-messenger-app-nav-collapsed');
+        nav.querySelectorAll('[data-messenger-app-compact-hide], [data-messenger-app-menu]').forEach((node) => {
+          node.removeAttribute('data-messenger-app-compact-hide');
+          node.removeAttribute('data-messenger-app-menu');
+        });
+        document.body.classList.remove('messenger-app-resizing');
+      },
+    };
   }
 
-  let activeNav = null;
-  let cleanupActiveNav = null;
-  let navSearchObserver = null;
-  let navSearchTimer = null;
+  let domSnapshot = null;
+  let lastPublishedCount = null;
+  let lastBadgeCount = null;
+  let lastBadgeDataUrl = null;
+  let lastNotifyAt = 0;
+  let lastNotifySource = null;
 
-  const stopNavSearch = () => {
-    if (navSearchObserver) navSearchObserver.disconnect();
-    if (navSearchTimer !== null) clearTimeout(navSearchTimer);
-    navSearchObserver = null;
-    navSearchTimer = null;
+  function createBadgeDataUrl(count) {
+    if (count === lastBadgeCount) return lastBadgeDataUrl;
+    const canvas = document.createElement('canvas');
+    canvas.width = 48;
+    canvas.height = 48;
+    const context = canvas.getContext('2d');
+    if (!context) return null;
+
+    context.fillStyle = '#cc0000';
+    context.beginPath();
+    context.arc(24, 24, 24, 0, Math.PI * 2);
+    context.fill();
+    context.strokeStyle = '#ffffff';
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(24, 24, 23, 0, Math.PI * 2);
+    context.stroke();
+    const text = count > 99 ? '99+' : String(count);
+    context.fillStyle = '#ffffff';
+    context.font = `bold ${text.length > 2 ? 16 : text.length > 1 ? 22 : 28}px Arial`;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(text, 24, 25);
+
+    lastBadgeCount = count;
+    lastBadgeDataUrl = canvas.toDataURL('image/png');
+    return lastBadgeDataUrl;
+  }
+
+  function publishCanonicalState(notify = false, source = 'structure') {
+    const count = latestTitleHint.available
+      ? latestTitleHint.count
+      : (domSnapshot?.count || 0);
+    const now = performance.now();
+    if (notify && !notificationBaselineReady) notify = false;
+    if (notify
+      && lastNotifySource
+      && lastNotifySource !== source
+      && now - lastNotifyAt < CROSS_SOURCE_NOTIFY_WINDOW_MS) {
+      notify = false;
+    }
+
+    if (!notify && count === lastPublishedCount) return;
+    const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
+    ipcRenderer.send('publish-unread-state', { count, notify, badgeDataUrl });
+    lastPublishedCount = count;
+    if (notify) {
+      lastNotifyAt = now;
+      lastNotifySource = source;
+    }
+  }
+
+  handleTitleHint = (notify) => publishCanonicalState(notify, 'title');
+
+  let activeNav = null;
+  let activeMain = null;
+  let unreadTracker = null;
+  let navControls = null;
+  let structureTimerId = null;
+
+  const unmountNav = (publishFallback = true) => {
+    unreadTracker?.cleanup();
+    navControls?.cleanup();
+    unreadTracker = null;
+    navControls = null;
+    activeNav = null;
+    domSnapshot = null;
+    if (publishFallback) publishCanonicalState(false, 'structure');
+  };
+
+  const scheduleStructure = () => {
+    if (structureTimerId !== null) return;
+    structureTimerId = setTimeout(() => {
+      structureTimerId = null;
+      reconcileStructureWithoutFeedback();
+    }, 0);
   };
 
   const mountNav = (nav) => {
-    stopNavSearch();
-    if (cleanupActiveNav) cleanupActiveNav();
-
     activeNav = nav;
     const saved = loadState();
-    const cleanupFullHeightLayout = setupFullHeightLayout(nav);
-    let domBaselineAdopted = false;
-    const unreadTracker = setupUnreadTracker(nav, (count, hasNewUnread) => {
-      setDomUnreadCount(count, { silent: !domBaselineAdopted, hasNewUnread });
-      domBaselineAdopted = true;
+    navControls = setupNavControls(nav, saved, scheduleStructure);
+    unreadTracker = setupUnreadTracker(nav, (snapshot) => {
+      startNotificationBaselineCapture();
+      domSnapshot = snapshot;
+      publishCanonicalState(snapshot.notify, 'dom');
     });
-    const resize = setupNavResize(nav, saved);
-    const cleanupMenuToggle = setupMenuToggle(saved, resize.refreshHandlePosition);
+  };
 
-    const replacementObservers = [];
-    const checkForReplacement = () => {
-      if (activeNav === nav && !nav.isConnected) {
-        cleanupActiveNav();
-        cleanupActiveNav = null;
-        activeNav = null;
-        waitForNav();
-      }
-    };
-
-    let ancestor = nav.parentNode;
-    while (ancestor && ancestor !== document) {
-      const observer = new MutationObserver(checkForReplacement);
-      observer.observe(ancestor, { childList: true });
-      replacementObservers.push(observer);
-      ancestor = ancestor.parentNode;
+  function reconcileStructure() {
+    let nextNav = findVisibleConversationList();
+    if (!nextNav && isElementStructurallyShown(activeNav)) nextNav = activeNav;
+    let nextMain = nextNav ? findVisibleMain(nextNav) : null;
+    if (!nextMain && nextNav === activeNav && isElementStructurallyShown(activeMain)) {
+      nextMain = activeMain;
     }
 
-    cleanupActiveNav = () => {
-      replacementObservers.forEach((observer) => observer.disconnect());
-      cleanupFullHeightLayout();
-      unreadTracker.cleanup();
-      resize.cleanup();
-      cleanupMenuToggle();
-    };
-  };
-
-  const tryMountNav = () => {
-    navSearchTimer = null;
-    const nav = findConversationList();
-    if (nav) mountNav(nav);
-  };
-
-  const scheduleNavSearch = () => {
-    if (navSearchTimer === null) {
-      navSearchTimer = setTimeout(tryMountNav, NAV_SEARCH_DEBOUNCE_MS);
-    }
-  };
-
-  function waitForNav() {
-    stopNavSearch();
-
-    const nav = findConversationList();
-    if (nav) {
-      mountNav(nav);
+    if (!nextNav || !nextMain) {
+      if (activeNav) unmountNav();
+      activeMain = null;
+      clearManagedLayout();
+      document.documentElement.classList.remove('messenger-app-mounted');
+      document.body.classList.remove(
+        'messenger-app-compact',
+        'messenger-app-menu-hidden',
+        'messenger-app-mounted',
+      );
       return;
     }
 
-    navSearchObserver = new MutationObserver(scheduleNavSearch);
-    navSearchObserver.observe(document.documentElement, { childList: true, subtree: true });
+    if (activeNav !== nextNav) {
+      if (activeNav) unmountNav(false);
+      mountNav(nextNav);
+    }
+    activeMain = nextMain;
+    document.documentElement.classList.add('messenger-app-mounted');
+    document.body.classList.add('messenger-app-mounted');
+    applyManagedLayout(nextNav, nextMain);
+    navControls?.refresh();
   }
 
-  waitForNav();
-});
+  const nodeContainsStructuralCandidate = (node) => {
+    if (node?.nodeType !== Node.ELEMENT_NODE) return false;
+      if (node.matches('[role="main"], [role="navigation"], [role="banner"], [aria-label], ' + EDITOR_SELECTOR)) {
+      const label = normalizeText(node.getAttribute('aria-label'));
+      if (node.matches('[role="main"], [role="banner"], ' + EDITOR_SELECTOR)
+        || NAV_LABELS.has(label)
+        || node.matches('[role="navigation"]') && label === 'facebook'
+        || node.matches('[role="navigation"]') && node.querySelector(THREAD_LINK_SELECTOR)) {
+        return true;
+      }
+    }
+    return Boolean(node.querySelector('[role="main"], [role="banner"], ' + EDITOR_SELECTOR))
+      || Array.from(node.querySelectorAll('[aria-label], [role="navigation"]')).some((candidate) => (
+        NAV_LABELS.has(normalizeText(candidate.getAttribute('aria-label')))
+        || candidate.matches('[role="navigation"]')
+          && normalizeText(candidate.getAttribute('aria-label')) === 'facebook'
+        || candidate.matches('[role="navigation"]') && candidate.querySelector(THREAD_LINK_SELECTOR)
+      ));
+  };
+
+  const isManagedStructureAttributeExpected = (node, attribute) => {
+    if (!(node instanceof Element)) return false;
+    switch (attribute) {
+      case 'data-messenger-app-nav':
+      case 'data-messenger-app-custom-width':
+        return node === activeNav && navControls !== null;
+      case 'data-messenger-app-nav-collapsed':
+        return node === activeNav
+          && navControls !== null
+          && Number.parseFloat(node.style.getPropertyValue('--messenger-app-nav-width')) < 10;
+      case 'data-messenger-app-viewport-root':
+        return node === managedLayout.viewportRoot;
+      case 'data-messenger-app-relative-root':
+        return node === managedLayout.viewportRoot
+          && managedLayout.viewportRootNeedsRelativeOffset;
+      case 'data-messenger-app-fill':
+        return managedLayout.fillNodes.has(node);
+      case 'data-messenger-app-thread-fill':
+        return managedLayout.threadNodes.has(node);
+      case 'data-messenger-app-global-banner':
+        return managedLayout.banners.has(node);
+      default:
+        return false;
+    }
+  };
+
+  // MutationObserver already batches a DOM commit. Reconcile that batch
+  // directly so a tray-hidden/occluded window never depends on throttled
+  // timers or a suspended animation frame to remount its unread observer.
+  const reconcileObservedStructure = () => {
+    if (structureTimerId !== null) {
+      clearTimeout(structureTimerId);
+      structureTimerId = null;
+    }
+    reconcileStructureWithoutFeedback();
+  };
+
+  const structureObserver = new MutationObserver((mutations) => {
+    if (activeNav && (!activeNav.isConnected || !activeMain?.isConnected)) {
+      reconcileObservedStructure();
+      return;
+    }
+
+    if (!activeNav) {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes') {
+          const target = mutation.target.nodeType === Node.ELEMENT_NODE
+            ? mutation.target
+            : mutation.target.parentElement;
+          if (nodeContainsStructuralCandidate(target)) {
+            reconcileObservedStructure();
+            return;
+          }
+        } else {
+          const target = mutation.target.nodeType === Node.ELEMENT_NODE
+            ? mutation.target
+            : mutation.target.parentElement;
+          const navigationAncestor = target?.closest?.('[role="navigation"]');
+          let labelledAncestor = target;
+          while (labelledAncestor && labelledAncestor !== document.body) {
+            if (NAV_LABELS.has(normalizeText(labelledAncestor.getAttribute?.('aria-label')))) break;
+            labelledAncestor = labelledAncestor.parentElement;
+          }
+          if (nodeContainsStructuralCandidate(navigationAncestor)
+            || nodeContainsStructuralCandidate(labelledAncestor)
+            || [...mutation.addedNodes, ...mutation.removedNodes].some(nodeContainsStructuralCandidate)) {
+            reconcileObservedStructure();
+            return;
+          }
+        }
+      }
+      return;
+    }
+
+    for (const mutation of mutations) {
+      const target = mutation.target.nodeType === Node.ELEMENT_NODE
+        ? mutation.target
+        : mutation.target.parentElement;
+      if (mutation.type === 'attributes') {
+        if (MANAGED_STRUCTURE_ATTRIBUTES.has(mutation.attributeName)) {
+          if (isManagedStructureAttributeExpected(target, mutation.attributeName)
+            && !target.hasAttribute(mutation.attributeName)) {
+            reconcileObservedStructure();
+            return;
+          }
+          continue;
+        }
+        if (mutation.attributeName === 'style'
+          && target === activeNav
+          && target.hasAttribute('data-messenger-app-nav')
+          && target.hasAttribute('data-messenger-app-custom-width')
+          && target.style.getPropertyValue('--messenger-app-nav-width')
+          && isElementVisible(activeNav, { allowZeroWidth: true })) {
+          // Our drag writes only the managed width variable. Its current value
+          // is authoritative until pointerup persists the new preference.
+          continue;
+        }
+        if (target === activeNav
+          || target === activeMain
+          || target?.contains(activeNav)
+          || target?.contains(activeMain)
+          || nodeContainsStructuralCandidate(target)) {
+          reconcileObservedStructure();
+          return;
+        }
+      } else if (target === document.body
+        || target === document.documentElement
+        || target === activeNav?.parentElement
+        || target === activeMain?.parentElement
+        || [...mutation.addedNodes, ...mutation.removedNodes].some(nodeContainsStructuralCandidate)) {
+        reconcileObservedStructure();
+        return;
+      }
+    }
+  });
+
+  const reconcileStructureWithoutFeedback = () => {
+    reconcileStructure();
+    // Every managed write is synchronous. Drop just those records before the
+    // next observer delivery so integrity repair cannot recursively trigger
+    // itself, while later host-page mutations remain observable.
+    structureObserver.takeRecords();
+  };
+
+  structureObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: [
+      'aria-hidden',
+      'aria-label',
+      'class',
+      'data-messenger-app-custom-width',
+      'data-messenger-app-fill',
+      'data-messenger-app-global-banner',
+      'data-messenger-app-nav',
+      'data-messenger-app-nav-collapsed',
+      'data-messenger-app-relative-root',
+      'data-messenger-app-thread-fill',
+      'data-messenger-app-viewport-root',
+      'hidden',
+      'role',
+      'style',
+    ],
+    childList: true,
+    subtree: true,
+  });
+
+  const onViewportChange = () => {
+    navControls?.refresh();
+    scheduleStructure();
+  };
+  window.addEventListener('resize', onViewportChange, { passive: true });
+  window.visualViewport?.addEventListener('resize', onViewportChange, { passive: true });
+  window.visualViewport?.addEventListener('scroll', onViewportChange, { passive: true });
+
+  reconcileStructureWithoutFeedback();
+  publishCanonicalState(false, 'structure');
+}, { once: true });
