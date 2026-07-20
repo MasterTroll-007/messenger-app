@@ -613,11 +613,9 @@ app.whenReady().then(() => {
 
   // Keep the update request away from Messenger's cold-start network burst.
   if (app.isPackaged) {
-    mainWindow.webContents.once('did-finish-load', () => {
-      setTimeout(() => {
-        if (!isQuitting) autoUpdater.checkForUpdates();
-      }, 30000);
-    });
+    setTimeout(() => {
+      if (!isQuitting) autoUpdater.checkForUpdates();
+    }, 30000);
   }
 });
 
