@@ -675,17 +675,89 @@ window.addEventListener('DOMContentLoaded', () => {
     const identityRefreshStates = new Set();
     const SIGNATURE_STABILITY_MS = 180;
     const IDENTITY_REFRESH_QUIET_MS = 750;
+    const MISSING_COUNT_GRACE_MS = 1000;
     let flushScheduled = false;
+    let missingExpiryTimer = null;
     let disposed = false;
     let lastReportedCount = null;
 
     const currentCount = () => {
       let count = 0;
       threadState.forEach((state) => {
-        if (state.unread) count += 1;
+        if (state.unread && state.counted !== false) count += 1;
       });
       return Math.min(count, 9999);
     };
+
+    const publishCountIfChanged = () => {
+      const count = currentCount();
+      if (count === lastReportedCount) return;
+      lastReportedCount = count;
+      onSnapshot({ count, notify: false });
+    };
+
+    function scheduleMissingExpiry() {
+      if (missingExpiryTimer !== null) {
+        clearTimeout(missingExpiryTimer);
+        missingExpiryTimer = null;
+      }
+      if (disposed) return;
+
+      const now = performance.now();
+      let nextDeadline = Infinity;
+      threadState.forEach((state) => {
+        if (state.present === false
+          && state.counted !== false
+          && Number.isFinite(state.missingSince)) {
+          nextDeadline = Math.min(nextDeadline, state.missingSince + MISSING_COUNT_GRACE_MS);
+        }
+      });
+      if (!Number.isFinite(nextDeadline)) return;
+
+      missingExpiryTimer = setTimeout(() => {
+        missingExpiryTimer = null;
+        if (disposed) return;
+
+        const expiryNow = performance.now();
+        const presentIds = new Set();
+        nav.querySelectorAll(THREAD_LINK_SELECTOR).forEach((link) => {
+          const id = threadIdentity(link);
+          if (id) presentIds.add(id);
+        });
+
+        let recoveredPresentThread = false;
+        threadState.forEach((state, id) => {
+          if (state.present !== false
+            || state.counted === false
+            || !Number.isFinite(state.missingSince)
+            || expiryNow - state.missingSince < MISSING_COUNT_GRACE_MS) return;
+
+          if (presentIds.has(id)) {
+            threadState.set(id, {
+              ...state,
+              present: true,
+              counted: true,
+              missingSince: null,
+            });
+            markDirty(id);
+            recoveredPresentThread = true;
+          } else {
+            threadState.set(id, {
+              ...state,
+              present: false,
+              counted: false,
+              missingSince: null,
+            });
+          }
+        });
+
+        // Update the DOM snapshot even when an available title hint currently
+        // masks it; a later title-format change must not revive stale unread.
+        publishCountIfChanged();
+        if (recoveredPresentThread) scheduleFlush();
+        scheduleMissingExpiry();
+      }, Math.max(1, Math.ceil(nextDeadline - now)));
+    }
 
     const touchState = (id, value) => {
       threadState.delete(id);
@@ -695,7 +767,14 @@ window.addEventListener('DOMContentLoaded', () => {
     const trimState = () => {
       while (threadState.size > MAX_TRACKED_THREADS) {
         let evictedId = null;
+        for (const [candidate, state] of threadState) {
+          if (state.present === false && state.counted === false) {
+            evictedId = candidate;
+            break;
+          }
+        }
         for (const candidate of threadState.keys()) {
+          if (evictedId !== null) break;
           if (!dirtyIds.has(candidate) && !pendingNotifications.has(candidate)) {
             evictedId = candidate;
             break;
@@ -738,7 +817,10 @@ window.addEventListener('DOMContentLoaded', () => {
       const timer = setTimeout(() => {
         pendingNotifications.delete(id);
         const current = threadState.get(id);
-        if (!current?.unread || current.signature !== signature) return;
+        if (!current?.unread
+          || current.present === false
+          || current.counted === false
+          || current.signature !== signature) return;
         onSnapshot({ count: currentCount(), notify: true, crossSourceExempt });
       }, SIGNATURE_STABILITY_MS);
       pendingNotifications.set(id, { signature, timer });
@@ -756,6 +838,15 @@ window.addEventListener('DOMContentLoaded', () => {
       const nextId = threadIdentity(link);
       if (previousId) markDirty(previousId, reasons);
       if (nextId) {
+        const existingState = threadState.get(nextId);
+        if (existingState
+          && (existingState.present === false || reasons?.identityHydration === true)) {
+          // A virtualized/tombstoned row can hydrate its preview in a later
+          // mutation. The same applies when React replaces a known row within
+          // one observer batch, before it can be marked missing. Treat both
+          // sequences like identity reuse so they stay silent until settled.
+          refreshIdentityHydration(link);
+        }
         markDirty(nextId, reasons);
         linkIdentity.set(link, nextId);
       } else {
@@ -802,6 +893,17 @@ window.addEventListener('DOMContentLoaded', () => {
         const allLinks = groups.get(id);
         if (!allLinks?.length) {
           cancelPendingNotification(id);
+          const previous = threadState.get(id);
+          if (previous && previous.present !== false) {
+            // Keep the last signature briefly so ordinary list virtualization
+            // neither flickers the badge nor turns hydration into a message.
+            // A permanently absent row stops contributing after the grace.
+            threadState.set(id, {
+              ...previous,
+              present: false,
+              missingSince: performance.now(),
+            });
+          }
           continue;
         }
         // Finish all style/layout reads before writing our row markers. A
@@ -875,17 +977,16 @@ window.addEventListener('DOMContentLoaded', () => {
           signature,
           stable,
           pendingUnreadTransition,
+          present: true,
+          counted: true,
+          missingSince: null,
         });
       }
       trimState();
       dirtyIds.clear();
       notificationEligibleIds.clear();
-
-      const count = currentCount();
-      if (count !== lastReportedCount) {
-        lastReportedCount = count;
-        onSnapshot({ count, notify: false });
-      }
+      scheduleMissingExpiry();
+      publishCountIfChanged();
     };
 
     const scheduleFlush = () => {
@@ -963,7 +1064,13 @@ window.addEventListener('DOMContentLoaded', () => {
             notificationEligible: !isIdentityRefreshMutation(mutation),
           });
           mutation.addedNodes.forEach((node) => {
-            collectLinks(node, true, { notificationEligible: false });
+            const addsThreadLink = node?.nodeType === Node.ELEMENT_NODE
+              && (node.matches?.(THREAD_LINK_SELECTOR)
+                || node.querySelector?.(THREAD_LINK_SELECTOR));
+            collectLinks(node, true, {
+              notificationEligible: false,
+              identityHydration: Boolean(addsThreadLink),
+            });
           });
           mutation.removedNodes.forEach(markRemovedLinks);
         }
@@ -1005,6 +1112,8 @@ window.addEventListener('DOMContentLoaded', () => {
         notificationEligibleIds.clear();
         pendingNotifications.forEach(({ timer }) => clearTimeout(timer));
         pendingNotifications.clear();
+        if (missingExpiryTimer !== null) clearTimeout(missingExpiryTimer);
+        missingExpiryTimer = null;
         identityRefreshStates.forEach(({ timer }) => {
           if (timer !== null) clearTimeout(timer);
         });

@@ -446,12 +446,138 @@ async function run() {
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`window.__rowC.remove()`);
-    await delay(150);
+    await delay(250);
     assert.equal(publishedStates.length, 0, 'virtualization removal changed the canonical state');
     await win.webContents.executeJavaScript(`document.querySelector('#live-nav').appendChild(window.__rowC)`);
-    await delay(150);
+    await delay(1100);
     assert.equal(publishedStates.length, 0, 'virtualization reinsertion generated a false notification');
 
+    // React can replace a known row within one observer batch, so there is no
+    // intermediate "missing" flush. Its delayed skeleton hydration must still
+    // be quiet, while a later real preview change remains eligible.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`new Promise((resolve) => {
+      const replacement = document.createElement('a');
+      replacement.id = 'row-c';
+      replacement.className = 'thread';
+      replacement.href = 'https://www.facebook.com/messages/t/c';
+      replacement.setAttribute('data-unread', 'true');
+      replacement.innerHTML = '<img alt=""><span dir="auto">Carol</span><span dir="auto"></span><button aria-label="Mark as read"></button>';
+      window.__rowC.replaceWith(replacement);
+      window.__rowC = replacement;
+      setTimeout(() => {
+        replacement.querySelectorAll('[dir="auto"]')[1].textContent = 'Delayed replacement hydration';
+        resolve(true);
+      }, 50);
+    })`);
+    await delay(300);
+    assert.equal(publishedStates.length, 0, 'same-batch row replacement hydration generated a notification');
+    await delay(550);
+    await win.webContents.executeJavaScript(`
+      window.__rowC.querySelectorAll('[dir="auto"]')[1].textContent = 'Real message after replacement quiet period';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 2 && state.notify),
+      'real message after same-batch replacement was suppressed',
+    );
+
+    // A permanently removed unread thread must stop contributing to the DOM
+    // fallback after a grace period, while retaining enough identity to make a
+    // much later virtualized reappearance and delayed hydration silent.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__rowD = document.createElement('a');
+      window.__rowD.id = 'row-d';
+      window.__rowD.className = 'thread';
+      window.__rowD.href = 'https://www.facebook.com/messages/t/d';
+      window.__rowD.setAttribute('data-unread', 'true');
+      window.__rowD.innerHTML = '<img alt=""><span dir="auto">Dana</span><span dir="auto">Archived preview</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').appendChild(window.__rowD);
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 3), 'permanent-removal setup missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
+
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`window.__rowD.remove()`);
+    await delay(300);
+    assert.equal(publishedStates.length, 0, 'missing thread decremented before the virtualization grace');
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 2),
+      'permanently removed unread thread remained in the fallback count',
+    );
+    assert.deepEqual(
+      publishedStates.filter((state) => state.count === 2),
+      [{ count: 2, notify: false, hasBadge: true }],
+    );
+
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#live-nav').appendChild(window.__rowD)`);
+    await waitFor(() => publishedStates.some((state) => state.count === 3), 'expired thread did not rejoin the count');
+    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__rowD.querySelectorAll('[dir="auto"]')[1].textContent = 'Delayed virtualized hydration';
+    `);
+    await delay(850);
+    assert.equal(publishedStates.length, 0, 'delayed virtualized hydration generated a false notification');
+    await win.webContents.executeJavaScript(`
+      window.__rowD.querySelectorAll('[dir="auto"]')[1].textContent = 'Real message after quiet period';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 3 && state.notify),
+      'real message after virtualized hydration was suppressed',
+    );
+
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__rowD.setAttribute('data-unread', 'false');
+      window.__rowD.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 2), 'reappeared thread read transition missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, false);
+    await win.webContents.executeJavaScript(`window.__rowD.remove()`);
+
+    // Removing a row while its stable-notification timer is pending must
+    // cancel the sound immediately, but retain the count until the same grace.
+    await win.webContents.executeJavaScript(`
+      window.__pendingRemoval = document.createElement('a');
+      window.__pendingRemoval.className = 'thread';
+      window.__pendingRemoval.href = 'https://www.facebook.com/messages/t/pending-removal';
+      window.__pendingRemoval.innerHTML = '<img alt=""><span dir="auto">Pending removal</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__pendingRemoval);
+    `);
+    await delay(100);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`new Promise((resolve) => {
+      window.__pendingRemoval.setAttribute('data-unread', 'true');
+      window.__pendingRemoval.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__pendingRemoval.querySelectorAll('[dir="auto"]')[1].textContent = 'Pending message';
+      setTimeout(() => {
+        window.__pendingRemoval.remove();
+        resolve(true);
+      }, 50);
+    })`);
+    await delay(250);
+    assert.ok(
+      publishedStates.some((state) => state.count === 3 && !state.notify),
+      'pending-removal transition missing',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'removed row emitted its pending notification',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.count === 2),
+      false,
+      'removed pending row decremented before the virtualization grace',
+    );
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 2 && !state.notify),
+      'removed pending row did not retire silently',
+    );
+
+    publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
       const duplicate = window.__rowC.cloneNode(true);
       duplicate.id = 'row-c-duplicate';
@@ -553,6 +679,29 @@ async function run() {
       && document.querySelectorAll('[data-messenger-app-resize-handle]').length === 1
     `), 'main replacement did not reconcile cleanly');
 
+    const liveCountBeforeCleanup = publishedStates.findLast(
+      (state) => Number.isSafeInteger(state.count),
+    )?.count;
+    assert.ok(Number.isSafeInteger(liveCountBeforeCleanup), 'live count unavailable before cleanup race test');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const cleanupRow = document.createElement('a');
+      cleanupRow.id = 'cleanup-row';
+      cleanupRow.className = 'thread';
+      cleanupRow.href = 'https://www.facebook.com/messages/t/cleanup';
+      cleanupRow.setAttribute('data-unread', 'true');
+      cleanupRow.innerHTML = '<img alt=""><span dir="auto">Cleanup</span><span dir="auto">Pending retirement</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').appendChild(cleanupRow);
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === liveCountBeforeCleanup + 1),
+      'cleanup race setup missing',
+    );
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#cleanup-row').remove()`);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'cleanup race decremented before its grace');
+
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
       document.querySelector('#live-nav').style.display = 'none';
@@ -563,6 +712,9 @@ async function run() {
     ), 'visible nav cache was not selected');
     await waitFor(() => publishedStates.some((state) => state.count === 0), 'new nav baseline missing');
     assert.equal(publishedStates.findLast((state) => state.count === 0).notify, false);
+    publishedStates.length = 0;
+    await delay(1100);
+    assert.equal(publishedStates.length, 0, 'disposed tracker published its missing-thread expiry');
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
