@@ -124,12 +124,6 @@ function setDomUnreadCount(rawCount, options) {
   applyUnreadCount(effectiveUnreadCount(), options);
 }
 
-function clearDomUnreadCount() {
-  if (domUnreadCount === null) return;
-  domUnreadCount = null;
-  applyUnreadCount(effectiveUnreadCount());
-}
-
 ipcRenderer.on('unread-count-changed', (event, rawCount) => {
   titleUnreadCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
   if (domUnreadCount === null) applyUnreadCount(effectiveUnreadCount());
@@ -713,7 +707,6 @@ window.addEventListener('DOMContentLoaded', () => {
       unreadTracker.cleanup();
       resize.cleanup();
       cleanupMenuToggle();
-      clearDomUnreadCount();
     };
   };
 
