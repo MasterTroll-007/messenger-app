@@ -201,7 +201,10 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     html.messenger-app-mounted,
     body.messenger-app-mounted {
-      overflow: hidden !important;
+      height: 100% !important;
+      min-height: 0 !important;
+      max-height: 100% !important;
+      overflow: clip !important;
     }
     [data-messenger-app-fill] {
       box-sizing: border-box !important;
@@ -395,6 +398,50 @@ window.addEventListener('DOMContentLoaded', () => {
     fillNodes: new Set(),
     threadNodes: new Set(),
     banners: new Set(),
+  };
+  const pageConstraintBackups = new Map();
+  const PAGE_CONSTRAINTS = new Map([
+    ['height', '100%'],
+    ['min-height', '0'],
+    ['max-height', '100%'],
+    ['overflow-x', 'clip'],
+    ['overflow-y', 'clip'],
+  ]);
+
+  const applyPageConstraints = () => {
+    for (const node of [document.documentElement, document.body]) {
+      if (!pageConstraintBackups.has(node)) {
+        const backup = new Map();
+        PAGE_CONSTRAINTS.forEach((_value, property) => {
+          backup.set(property, {
+            value: node.style.getPropertyValue(property),
+            priority: node.style.getPropertyPriority(property),
+          });
+        });
+        pageConstraintBackups.set(node, backup);
+      }
+      PAGE_CONSTRAINTS.forEach((value, property) => {
+        if (node.style.getPropertyValue(property) !== value
+          || node.style.getPropertyPriority(property) !== 'important') {
+          node.style.setProperty(property, value, 'important');
+        }
+      });
+      if (node.scrollTop !== 0) node.scrollTop = 0;
+      if (node.scrollLeft !== 0) node.scrollLeft = 0;
+    }
+    const scrollingElement = document.scrollingElement;
+    if (scrollingElement?.scrollTop) scrollingElement.scrollTop = 0;
+    if (scrollingElement?.scrollLeft) scrollingElement.scrollLeft = 0;
+  };
+
+  const clearPageConstraints = () => {
+    pageConstraintBackups.forEach((backup, node) => {
+      backup.forEach(({ value, priority }, property) => {
+        if (value) node.style.setProperty(property, value, priority);
+        else node.style.removeProperty(property);
+      });
+    });
+    pageConstraintBackups.clear();
   };
 
   const replaceManagedSet = (current, next, attribute) => {
@@ -1290,6 +1337,7 @@ window.addEventListener('DOMContentLoaded', () => {
         'messenger-app-menu-hidden',
         'messenger-app-mounted',
       );
+      clearPageConstraints();
       return;
     }
 
@@ -1300,6 +1348,7 @@ window.addEventListener('DOMContentLoaded', () => {
     activeMain = nextMain;
     document.documentElement.classList.add('messenger-app-mounted');
     document.body.classList.add('messenger-app-mounted');
+    applyPageConstraints();
     applyManagedLayout(nextNav, nextMain);
     navControls?.refresh();
   }

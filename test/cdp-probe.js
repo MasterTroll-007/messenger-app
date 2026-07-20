@@ -100,6 +100,32 @@ async function main() {
         };
       });
       const allThreadLinks = Array.from(document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]'));
+      const verticalScrollers = Array.from(document.querySelectorAll('*')).flatMap((node) => {
+        const overflow = node.scrollHeight - node.clientHeight;
+        if (overflow <= 0.5 || node.clientHeight <= 1) return [];
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 1 || rect.height <= 1 || rect.bottom <= 0 || rect.top >= viewportHeight) return [];
+        const overflowY = getComputedStyle(node).overflowY;
+        if (overflowY !== 'auto' && overflowY !== 'scroll') return [];
+        return [{
+          tag: node.tagName,
+          role: node.getAttribute('role'),
+          top: rect.top,
+          bottom: rect.bottom,
+          left: rect.left,
+          width: rect.width,
+          height: rect.height,
+          clientHeight: node.clientHeight,
+          scrollHeight: node.scrollHeight,
+          overflow,
+          overflowY,
+          insideNav: Boolean(nav?.contains(node)),
+          insideMain: Boolean(main?.contains(node)),
+          containsEditor: Boolean(editor && node.contains(editor)),
+          threadFill: node.hasAttribute('data-messenger-app-thread-fill'),
+          viewportRoot: node.hasAttribute('data-messenger-app-viewport-root'),
+        }];
+      }).sort((a, b) => a.left - b.left || a.top - b.top || a.height - b.height).slice(0, 80);
       const navigationCandidates = Array.from(document.querySelectorAll('[role="navigation"], [aria-label="Conversation list"], [aria-label="Chat list"], [aria-label="Seznam konverzací"]'))
         .map((candidate) => {
           const rect = candidate.getBoundingClientRect();
@@ -138,10 +164,34 @@ async function main() {
           && ['facebook.com', 'www.facebook.com'].includes(location.hostname)
           && (location.pathname === '/messages' || location.pathname.startsWith('/messages/')),
         viewportHeight,
+        innerHeight: window.innerHeight,
+        visualViewportOffsetTop: window.visualViewport?.offsetTop ?? null,
         visibilityState: document.visibilityState,
         hasFocus: document.hasFocus(),
+        styleElementCount: document.querySelectorAll('#messenger-app-styles').length,
+        styleHasMountedOverflowRule: document.querySelector('#messenger-app-styles')?.textContent
+          .includes('body.messenger-app-mounted') ?? false,
         managedBodyClasses: Array.from(document.body.classList)
           .filter((name) => name.startsWith('messenger-app-')),
+        bodyMetrics: {
+          inlineStyle: document.body.getAttribute('style'),
+          top: document.body.getBoundingClientRect().top,
+          height: document.body.getBoundingClientRect().height,
+          clientHeight: document.body.clientHeight,
+          scrollHeight: document.body.scrollHeight,
+          scrollTop: document.body.scrollTop,
+          overflowY: getComputedStyle(document.body).overflowY,
+        },
+        htmlMetrics: {
+          inlineStyle: document.documentElement.getAttribute('style'),
+          top: document.documentElement.getBoundingClientRect().top,
+          height: document.documentElement.getBoundingClientRect().height,
+          clientHeight: document.documentElement.clientHeight,
+          scrollHeight: document.documentElement.scrollHeight,
+          scrollTop: document.documentElement.scrollTop,
+          overflowY: getComputedStyle(document.documentElement).overflowY,
+        },
+        scrollingElement: document.scrollingElement?.tagName ?? null,
         documentOverflow: document.documentElement.scrollHeight - viewportHeight,
         activeNavCount: document.querySelectorAll('[data-messenger-app-nav]').length,
         visibleMainCount: Array.from(document.querySelectorAll('[role="main"]')).filter((node) => {
@@ -154,6 +204,15 @@ async function main() {
         viewportRootCount: document.querySelectorAll('[data-messenger-app-viewport-root]').length,
         rootTop: rootRect?.top ?? null,
         rootHeight: rootRect?.height ?? null,
+        rootComputed: root ? {
+          position: getComputedStyle(root).position,
+          top: getComputedStyle(root).top,
+          height: getComputedStyle(root).height,
+          maxHeight: getComputedStyle(root).maxHeight,
+          overflowY: getComputedStyle(root).overflowY,
+          inlineRootTop: root.style.getPropertyValue('--messenger-app-root-top'),
+          inlineViewportHeight: root.style.getPropertyValue('--messenger-app-viewport-height'),
+        } : null,
         navWidth: navRect?.width ?? null,
         mainWidth: mainRect?.width ?? null,
         threadBottom: threadRegion?.getBoundingClientRect().bottom ?? null,
@@ -166,6 +225,7 @@ async function main() {
           const rect = link.getBoundingClientRect();
           return rect.width > 1 && rect.height > 1 && rect.bottom > 0 && rect.top < window.innerHeight;
         }).length,
+        verticalScrollers,
         navigationCandidates,
         settledStyleMutations,
         rowSignalSummary: {

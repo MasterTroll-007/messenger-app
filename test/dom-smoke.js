@@ -241,6 +241,26 @@ async function run() {
       delete window.__messengerTestRequestAnimationFrame;
     `);
 
+    // Meta can reapply a post-header body height and its own important page
+    // overflow after mount. It must not recreate a global scrollbar or retain
+    // a body scroll offset that shifts the whole Messenger shell upward.
+    await win.webContents.executeJavaScript(`
+      document.body.style.setProperty('height', 'calc(100% - 56px)', 'important');
+      document.body.style.setProperty('max-height', 'calc(100% - 56px)', 'important');
+      document.body.style.setProperty('overflow-y', 'auto', 'important');
+      document.body.scrollTop = 100;
+    `);
+    await waitFor(async () => win.webContents.executeJavaScript(`(() => {
+      const viewport = window.visualViewport?.height || window.innerHeight;
+      const root = document.querySelector('[data-messenger-app-viewport-root]').getBoundingClientRect();
+      const bodyStyle = getComputedStyle(document.body);
+      return Math.abs(document.body.getBoundingClientRect().height - viewport) <= 1
+        && bodyStyle.overflowY === 'clip'
+        && document.body.scrollTop === 0
+        && Math.abs(root.top) <= 1
+        && Math.abs(root.bottom - (viewport - 5)) <= 1;
+    })()`), 'global body scrollbar/offset returned after Meta style reconciliation');
+
     await win.webContents.executeJavaScript(`
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true, cancelable: true }));
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true, cancelable: true }));
