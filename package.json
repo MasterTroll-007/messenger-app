@@ -23,7 +23,9 @@
     "files": [
       "**/*",
       "!generate-icon.js",
-      "!play-test.ps1"
+      "!play-test.ps1",
+      "!create-icon.js",
+      "!create-ico.js"
     ],
     "win": {
       "target": "nsis",
