@@ -79,9 +79,12 @@ function claimTitleIncrease(generation) {
   if (titleIncreaseIsUnavailable(generation)) return false;
   claimedTitleIncreaseGenerations.add(generation);
   while (claimedTitleIncreaseGenerations.size > 128) {
-    const oldest = claimedTitleIncreaseGenerations.values().next().value;
-    claimedTitleIncreaseGenerations.delete(oldest);
-    retiredTitleIncreaseGeneration = Math.max(retiredTitleIncreaseGeneration, oldest);
+    let smallest = Infinity;
+    claimedTitleIncreaseGenerations.forEach((claimed) => {
+      if (claimed < smallest) smallest = claimed;
+    });
+    claimedTitleIncreaseGenerations.delete(smallest);
+    retiredTitleIncreaseGeneration = Math.max(retiredTitleIncreaseGeneration, smallest);
   }
   return true;
 }
@@ -898,7 +901,7 @@ window.addEventListener('DOMContentLoaded', () => {
         fallbackOnly: true,
         incoming: false,
         message: null,
-        signature,
+        signature: parts.map(normalizeText).join('\u001f').slice(0, 1024),
         substantive: true,
       };
     }
