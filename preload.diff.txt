@@ -1,0 +1,1483 @@
+diff --git a/preload.js b/preload.js
+index 9011cc9..3ab7aa8 100644
+--- a/preload.js
++++ b/preload.js
+@@ -4,8 +4,6 @@ const { ipcRenderer } = require('electron');
+ 
+ const SOUND_URL = 'messenger-asset://notification/sound';
+ const AUDIO_COALESCE_MS = 300;
+-const TITLE_BASELINE_CAPTURE_MS = 1500;
+-const TITLE_REAPPEAR_NOTIFY_WINDOW_MS = 1000;
+ let notificationAudio = null;
+ let notificationAudioVersion = 0;
+ let playScheduled = false;
+@@ -59,23 +57,49 @@ ipcRenderer.on('stop-notification-sound', stopNotificationSound);
+ ipcRenderer.on('notification-sound-updated', reloadNotificationAudio);
+ 
+ let latestTitleHint = { available: false, count: 0 };
+-let lastAvailableTitleCount = null;
+-let titleUnavailableAt = -Infinity;
+-let titleBaselineReady = false;
+-let titleBaselineTimer = null;
+-let notificationBaselineReady = false;
+-let notificationBaselineTimer = null;
+ let handleTitleHint = null;
++let lastObservedTitleCount = null;
++let latestTitleIncrease = {
++  at: -Infinity,
++  from: null,
++  generation: 0,
++  to: null,
++};
++const claimedTitleIncreaseGenerations = new Set();
++const pendingKnownTitleExpectations = [];
++let retiredTitleIncreaseGeneration = 0;
++
++function titleIncreaseIsUnavailable(generation) {
++  return !Number.isSafeInteger(generation)
++    || generation <= retiredTitleIncreaseGeneration
++    || claimedTitleIncreaseGenerations.has(generation);
++}
++
++function claimTitleIncrease(generation) {
++  if (titleIncreaseIsUnavailable(generation)) return false;
++  claimedTitleIncreaseGenerations.add(generation);
++  while (claimedTitleIncreaseGenerations.size > 128) {
++    let smallest = Infinity;
++    claimedTitleIncreaseGenerations.forEach((claimed) => {
++      if (claimed < smallest) smallest = claimed;
++    });
++    claimedTitleIncreaseGenerations.delete(smallest);
++    retiredTitleIncreaseGeneration = Math.max(retiredTitleIncreaseGeneration, smallest);
++  }
++  return true;
++}
+ 
+-function startNotificationBaselineCapture() {
+-  if (notificationBaselineReady || notificationBaselineTimer !== null) return;
+-  notificationBaselineTimer = setTimeout(() => {
+-    notificationBaselineTimer = null;
+-    notificationBaselineReady = true;
+-  }, TITLE_BASELINE_CAPTURE_MS);
++function retireTitleIncreasesThrough(generation) {
++  if (!Number.isSafeInteger(generation)) return;
++  retiredTitleIncreaseGeneration = Math.max(retiredTitleIncreaseGeneration, generation);
++  claimedTitleIncreaseGenerations.forEach((claimed) => {
++    if (claimed <= retiredTitleIncreaseGeneration) claimedTitleIncreaseGenerations.delete(claimed);
++  });
++  pendingKnownTitleExpectations.length = 0;
+ }
+ 
+ ipcRenderer.on('title-unread-hint', (_event, rawHint) => {
++  const now = performance.now();
+   const available = rawHint?.available === true;
+   const count = available
+     && Number.isSafeInteger(rawHint.count)
+@@ -83,35 +107,19 @@ ipcRenderer.on('title-unread-hint', (_event, rawHint) => {
+     && rawHint.count <= 9999
+     ? rawHint.count
+     : 0;
+-  const nextHint = { available, count };
+-  const now = performance.now();
+-  const returningFromBriefGap = !latestTitleHint.available
+-    && lastAvailableTitleCount !== null
+-    && now - titleUnavailableAt <= TITLE_REAPPEAR_NOTIFY_WINDOW_MS;
+-  const previousCount = latestTitleHint.available
+-    ? latestTitleHint.count
+-    : lastAvailableTitleCount;
+-  const notify = titleBaselineReady
+-    && available
+-    && (latestTitleHint.available || returningFromBriefGap)
+-    && count > previousCount;
+-
+-  if (!available && latestTitleHint.available) titleUnavailableAt = now;
+-  latestTitleHint = nextHint;
+   if (available) {
+-    lastAvailableTitleCount = count;
+-    titleUnavailableAt = -Infinity;
+-  }
+-  if (!titleBaselineReady && titleBaselineTimer === null) {
+-    startNotificationBaselineCapture();
+-    // Capture startup hydration in one window anchored to the first value. Do
+-    // not restart this timer on every title change.
+-    titleBaselineTimer = setTimeout(() => {
+-      titleBaselineTimer = null;
+-      titleBaselineReady = true;
+-    }, TITLE_BASELINE_CAPTURE_MS);
++    if (lastObservedTitleCount !== null && count > lastObservedTitleCount) {
++      latestTitleIncrease = {
++        at: now,
++        from: lastObservedTitleCount,
++        generation: latestTitleIncrease.generation + 1,
++        to: count,
++      };
++    }
++    lastObservedTitleCount = count;
+   }
+-  if (handleTitleHint) handleTitleHint(notify);
++  latestTitleHint = { available, count };
++  if (handleTitleHint) handleTitleHint();
+ });
+ 
+ window.addEventListener('DOMContentLoaded', () => {
+@@ -120,7 +128,6 @@ window.addEventListener('DOMContentLoaded', () => {
+   const MIN_CHAT_WIDTH_PX = 280;
+   const MAX_NAV_WIDTH_PX = 600;
+   const MAX_TRACKED_THREADS = 500;
+-  const CROSS_SOURCE_NOTIFY_WINDOW_MS = AUDIO_COALESCE_MS;
+   const STRUCTURE_GAP_GRACE_MS = 1000;
+   const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
+   const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
+@@ -136,6 +143,7 @@ window.addEventListener('DOMContentLoaded', () => {
+     '[aria-label="Přepínač Doručených zpráv"]',
+     '[aria-label="Inbox switcher"]',
+   ].join(', ');
++  let foregroundEpoch = 0;
+   const SCOPED_CONTROL_SELECTOR = `${COMPACT_CONTROL_SELECTOR}, ${MENU_CONTROL_SELECTOR}`;
+   const MANAGED_STRUCTURE_ATTRIBUTES = new Set([
+     'data-messenger-app-custom-width',
+@@ -636,51 +644,342 @@ window.addEventListener('DOMContentLoaded', () => {
+     return false;
+   }
+ 
+-  const isVolatileRowText = (text) => {
++  const isCalendarRowText = (text) => {
++    const normalized = normalizeText(text);
++    return !normalized
++      || /^(?:now|just now|ted|prave ted|today|dnes|yesterday|vcera)$/.test(normalized)
++      || /^(?:(?:at|v)\s+)?\d{1,2}:\d{2}(?:\s*(?:am|pm))?$/.test(normalized)
++      || /^(?:(?:pred\s+)?(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?)$/.test(normalized)
++      || /^(?:mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday|po|pondeli|ut|utery|st|streda|ct|ctvrtek|pa|patek|so|sobota|ne|nedele)$/.test(normalized)
++      || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
++  };
++
++  const isStrongCalendarRowText = (text) => {
++    const normalized = normalizeText(text);
++    return /^(?:now|just now|ted|prave ted|today|dnes|yesterday|vcera)$/.test(normalized)
++      || /^(?:(?:at|v)\s+)?\d{1,2}:\d{2}(?:\s*(?:am|pm))?$/.test(normalized)
++      || /^pred\s+(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?$/.test(normalized)
++      || /^\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|tyd)(?:\s+ago)?$/.test(normalized)
++      || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
++  };
++
++  const isReactionRowText = (text) => {
++    const normalized = normalizeText(text);
++    return /^(?:reacted\b.*\bto your message|.+\s+reacted\b.*\bto your message|(?:.+\s+)?dal(?:\(a\)|a)? vasi zprave\b.*|(?:.+\s+)?reagoval(?:\(a\)|a)? na vasi zpravu\b.*)$/.test(normalized);
++  };
++
++  const isReceiptRowText = (text) => {
++    const normalized = normalizeText(text);
++    const match = /^(?:sent|seen|delivered|odeslano|zobrazeno|doruceno)(?:\s*[·\-–—]?\s*(.+))?$/.exec(normalized);
++    return Boolean(match) && (!match[1] || isCalendarRowText(match[1]));
++  };
++
++  const matchesRowText = (normalized, patterns) => (
++    patterns.some((pattern) => pattern.test(normalized))
++  );
++
++  const SECURITY_AND_SYNC_ROW_PATTERNS = [
++    /^(?:new(?::\s*|\s+))?messages and calls (?:are (?:secured|protected) with end-to-end encryption|are end-to-end encrypted)(?:[.!]?\s*only people in this chat can read,?\s*listen to,?\s*or share them(?:[.!]?\s*learn more)?)?[.!]?$/,
++    /^only people in this chat can read,?\s*listen to,?\s*or share them(?:[.!]?\s*learn more)?[.!]?$/,
++    /^(?:(?:nove|novinka)(?::\s*|\s+))?zpravy a hovory jsou (?:zabezpeceny|chraneny) koncovym sifrovanim(?:[.!]?\s*(?:jen|pouze) lide v tomto chatu (?:je )?(?:mohou|muzou) cist,?\s*poslouchat,?\s*nebo sdilet(?:[.!]?\s*(?:dalsi informace|zjistit vice))?)?[.!]?$/,
++    /^(?:jen|pouze) lide v tomto chatu (?:je )?(?:mohou|muzou) cist,?\s*poslouchat,?\s*nebo sdilet(?:[.!]?\s*(?:dalsi informace|zjistit vice))?[.!]?$/,
++    /^(?:learn more|dalsi informace|zjistit vice|precist si dalsi informace)[.!]?$/,
++    /^(?:(?:some|your)\s+)?(?:messages|chat history) (?:are|is) missing(?:[.!]?\s*(?:sync|restore) now)?[.!]?$/,
++    /^(?:chat history is missing[.!]?\s*)?enter your pin to (?:restore (?:your )?chat history|see messages that (?:are not|aren't) loaded on this device)[.!]?$/,
++    /^(?:sync|restore) now[.!]?$/,
++    /^(?:nektere\s+)?(?:zpravy|historie (?:chatu|konverzace)) (?:chybi|neni (?:uplna|kompletni|k dispozici))(?:[.!]?\s*(?:synchronizovat|obnovit)(?: ted| nyni)?)?[.!]?$/,
++    /^(?:historie (?:chatu|konverzace) chybi[.!]?\s*)?zadejte (?:svuj )?pin (?:pro|k) obnoveni historie (?:chatu|konverzace)[.!]?$/,
++    /^(?:synchronizovat|obnovit)(?: ted| nyni)?[.!]?$/,
++  ];
++
++  const CALL_ACTIVITY_ROW_PATTERNS = [
++    /^(?:(?:you|.+?)\s+)?missed (?:(?:a|an|your)\s+)?(?:(?:voice|video|audio)\s+)?call[.!]?$/,
++    /^(?:missed|incoming|outgoing) (?:(?:voice|video|audio)\s+)?call[.!]?$/,
++    /^(?:the\s+)?(?:(?:voice|video|audio)\s+)?(?:call|chat) (?:has\s+)?(?:ended|failed|declined|cancelled|canceled)[.!]?$/,
++    /^(?:(?:you|.+?)\s+)?(?:started|ended|joined|left|declined|cancelled|canceled) (?:(?:a|the|your)\s+)?(?:(?:voice|video|audio)\s+)?(?:call|chat)\b.*$/,
++    /^(?:you|.+?)\s+called you[.!]?$/,
++    /^(?:zmeskany|prichozi|odchozi) (?:(?:hlasovy|video)\s+)?(?:hovor|videohovor)[.!]?$/,
++    /^(?:.+\s+)?zmeskal(?:\(a\)|a)?\s+(?:(?:vas|tvuj)\s+)?(?:(?:hlasovy|video)\s+)?(?:hovor|videohovor)[.!]?$/,
++    /^(?:(?:hlasovy|video)\s+)?(?:hovor|videohovor) (?:skoncil|se nezdaril|byl odmitnut|byl zrusen)[.!]?$/,
++    /^(?:.+\s+)?(?:zahajil|ukoncil|odmitl|zrusil)(?:\(a\)|a)?\s+(?:(?:hlasovy|video)\s+)?(?:hovor|videohovor)\b.*$/,
++    /^.+\s+vam volal(?:\(a\)|a)?[.!]?$/,
++  ];
++
++  const CHAT_CUSTOMIZATION_ROW_PATTERNS = [
++    /^(?:.+\s+)?changed (?:the )?(?:chat )?(?:theme|colou?r)\b.*$/,
++    /^(?:.+\s+)?set (?:the )?(?:chat )?emoji\b.*$/,
++    /^(?:.+\s+)?(?:set|changed|removed) (?:(?:your|the) nickname|the nickname for .+|.+['’]s nickname)\b.*$/,
++    /^(?:.+\s+)?(?:zmenil|nastavil)(?:\(a\)|a)?\s+(?:motiv|tema|barvu)(?: chatu| konverzace)?\b.*$/,
++    /^(?:.+\s+)?(?:nastavil|zmenil)(?:\(a\)|a)?\s+emoji\b.*$/,
++    /^(?:.+\s+)?(?:nastavil|zmenil|odebral)(?:\(a\)|a)?\s+(?:(?:vasi|tvou|jeho|jeji)\s+)?prezdivku\b.*$/,
++    /^(?:.+\s+)?(?:nastavil|zmenil)(?:\(a\)|a)?\s+prezdivku pro\b.*$/,
++  ];
++
++  const PIN_AND_RETENTION_ROW_PATTERNS = [
++    /^(?:.+\s+)?(?:pinned|unpinned) (?:(?:a|the|your)\s+)?message\b.*$/,
++    /^(?:.+\s+)?(?:pripnul|odepnul)(?:\(a\)|a)?\s+zpravu\b.*$/,
++    /^(?:.+\s+)?zrusil(?:\(a\)|a)?\s+pripnuti zpravy\b.*$/,
++    /^(?:.+\s+)?(?:turned|switched) (?:on|off) (?:the )?disappearing messages\b.*$/,
++    /^(?:.+\s+)?(?:changed|set) (?:the )?disappearing message(?:s)? (?:timer|duration)\b.*$/,
++    /^(?:disappearing messages (?:are )?(?:on|off)|messages will disappear\b.*)$/,
++    /^(?:.+\s+)?(?:zapnul|vypnul|nastavil|zmenil)(?:\(a\)|a)?\s+(?:mizejici zpravy|automaticke (?:odstraneni|odstranovani|mazani) zprav)\b.*$/,
++    /^(?:mizejici zpravy jsou (?:zapnute|vypnute)|zpravy (?:automaticky )?zmizi\b.*)$/,
++  ];
++
++  const GROUP_ACTIVITY_ROW_PATTERNS = [
++    /^(?:.+\s+)?(?:named the group\b.*|changed (?:the )?group (?:name|photo)\b.*|left (?:the )?group\b.*|joined (?:(?:the )?group|using an invite link)\b.*|created (?:(?:the|this)\s+)?group\b.*|added .{1,100} to (?:the )?group\b.*|removed .{1,100} from (?:the )?group\b.*)$/,
++    /^(?:.+\s+)?(?:pojmenoval(?:\(a\)|a)? skupinu\b.*|zmenil(?:\(a\)|a)? (?:nazev|fotku|fotografii) skupiny\b.*|opustil(?:\(a\)|a)? skupinu\b.*|(?:se )?pripojil(?:\(a\)|a)? (?:(?:se )?ke skupine|pomoci odkazu s pozvankou)\b.*|vytvoril(?:\(a\)|a)? (?:tuto )?skupinu\b.*|pridal(?:\(a\)|a)? .{1,100} do (?:skupiny|skupinoveho chatu)\b.*|odebral(?:\(a\)|a)? .{1,100} ze (?:skupiny|skupinoveho chatu)\b.*)$/,
++  ];
++
++  const CONNECTION_SUGGESTION_ROW_PATTERNS = [
++    /^(?:(?:you are|you(?:'|’)?re) now|now you are) connected on messenger\b.*$/,
++    /^you can now message(?: and call)? each other\b.*$/,
++    /^say hi to your new (?:facebook )?friend\b.*$/,
++    /^(?:nyni|ted) jste (?:propojeni|spojeni) (?:na|v) messengeru\b.*$/,
++    /^(?:nyni|ted) si muzete (?:navzajem )?posilat zpravy(?: a volat si)?\b.*$/,
++    /^pozdravte (?:sveho noveho pritele|svou novou pritelkyni)\b.*$/,
++  ];
++
++  const SEND_STATUS_ROW_PATTERNS = [
++    /^(?:sending(?:\.{3}|…)?|failed to send|could(?: not|n't) send(?: message)?|unable to send(?: message)?|(?:this )?message (?:did(?: not|n't) send|failed to send))(?:[.!]?\s*(?:click to )?send again)?[.!]?$/,
++    /^(?:click to )?send again[.!]?$/,
++    /^(?:odesilani(?:\.{3}|…)?|odesila se(?:\.{3}|…)?|nepodarilo se odeslat|nelze odeslat(?: zpravu)?|(?:tuto )?zpravu se nepodarilo odeslat|odeslani se nezdarilo)(?:[.!]?\s*(?:kliknutim )?odeslete znovu)?[.!]?$/,
++    /^(?:kliknutim )?odeslete znovu[.!]?$/,
++  ];
++
++  const isSystemActivityRowText = (normalized) => (
++    matchesRowText(normalized, SECURITY_AND_SYNC_ROW_PATTERNS)
++    || matchesRowText(normalized, CALL_ACTIVITY_ROW_PATTERNS)
++    || matchesRowText(normalized, CHAT_CUSTOMIZATION_ROW_PATTERNS)
++    || matchesRowText(normalized, PIN_AND_RETENTION_ROW_PATTERNS)
++    || matchesRowText(normalized, GROUP_ACTIVITY_ROW_PATTERNS)
++    || matchesRowText(normalized, CONNECTION_SUGGESTION_ROW_PATTERNS)
++    || matchesRowText(normalized, SEND_STATUS_ROW_PATTERNS)
++    || /^(?:this message was (?:removed|deleted)|tato zprava byla (?:odstranena|smazana)|(?:you|.+) unsent a message|zrusili jste odeslani zpravy|.+\s+zrusil(?:\(a\)|a)? odeslani zpravy)[.!]?$/.test(normalized)
++  );
++
++  const isNonMessageRowText = (text) => {
+     const normalized = normalizeText(text);
+     return !normalized
+-      || /^(?:now|ted|today|dnes|yesterday|vcera)$/.test(normalized)
+-      || /^(?:\d{1,2}:\d{2}|(?:pred\s+)?\d+\s*(?:s|sec|m|min|h|hr|d|day|days|w|week|weeks|tyd|hod)(?:\s+(?:ago|zpet))?)$/.test(normalized)
+       || /^(?:active|aktivni|aktivni pred)\b/.test(normalized)
+       || /^(?:.{1,80}\s+)?(?:(?:is|are)\s+typing|typing|pise|pisou)(?:\s*(?:\.{3}|…))?$/.test(normalized)
+-      || /^(?:sent|seen|delivered|odeslano|zobrazeno|doruceno)$/.test(normalized)
++      || isReceiptRowText(text)
++      || /^(?:read by\b.*|seen by\b.*|videl\(a\) to\b.*|videla to\b.*|videl to\b.*|precetl\(a\)\b.*|precetla\b.*|precetl\b.*)$/.test(normalized)
++      || isReactionRowText(text)
++      || isSystemActivityRowText(normalized)
+       || /^(?:mark|oznacit)\b.*(?:read|precten)/.test(normalized);
+   };
+ 
+-  function rowSignature(link) {
++  const cleanDisplayText = (value) => String(value || '')
++    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
++    .replace(/\s+/gu, ' ')
++    .trim();
++
++  const pushDisplayPart = (parts, seen, value, {
++    dedupe = false,
++    filterCalendar = false,
++  } = {}) => {
++    const text = cleanDisplayText(value);
++    const key = normalizeText(text);
++    if (!text
++      || !key
++      || (dedupe && seen.has(key))
++      || isNonMessageRowText(text)
++      || (filterCalendar && isCalendarRowText(text))) return;
++    seen.add(key);
++    parts.push(text);
++  };
++
++  const calendarFilterFlags = (textNodes, {
++    allowStrongTrailingMessage = false,
++  } = {}) => textNodes.map((node, index) => {
++    const text = cleanDisplayText(node.textContent);
++    if (!text || !isCalendarRowText(text) || index === 0) return false;
++
++    const trailingNodesAreAuxiliary = textNodes.slice(index + 1).every((laterNode) => {
++      const laterText = cleanDisplayText(laterNode.textContent);
++      return !laterText || isNonMessageRowText(laterText);
++    });
++    if (!trailingNodesAreAuxiliary) return false;
++    const priorParts = textNodes.slice(0, index)
++      .map((priorNode) => cleanDisplayText(priorNode.textContent))
++      .filter((priorText) => priorText && !isNonMessageRowText(priorText));
++    if (isStrongCalendarRowText(text)) {
++      return !(allowStrongTrailingMessage && index === 1 && priorParts.length === 1);
++    }
++    const senderSplit = priorParts.length >= 2 && /:\s*$/u.test(priorParts.at(-1));
++    return index >= 2 && !senderSplit;
++  });
++
++  function rowDisplayState(link, { allowStrongTrailingMessage = false } = {}) {
+     const parts = [];
+-    link.querySelectorAll('[dir="auto"]').forEach((node) => {
++    const seen = new Set();
++    const textNodes = Array.from(link.querySelectorAll('[dir="auto"]'))
++      .filter((node) => !node.querySelector('[dir="auto"]'));
++    const calendarFlags = calendarFilterFlags(textNodes, { allowStrongTrailingMessage });
++    textNodes.forEach((node, index) => {
+       if (node.querySelector('[dir="auto"]')) return;
+-      const text = normalizeText(node.textContent);
+-      if (text && !isVolatileRowText(text)) parts.push(text);
++      pushDisplayPart(parts, seen, node.textContent, {
++        filterCalendar: calendarFlags[index],
++      });
+     });
+ 
++    // Emoji-only and sticker-only previews often have no text node at all.
++    // Their accessible image description is message content, while empty or
++    // profile-picture labels are presentation-only.
++    link.querySelectorAll('img[alt], [role="img"][aria-label]').forEach((node) => {
++      const label = node.getAttribute('alt') || node.getAttribute('aria-label');
++      if (node.closest('button, [role="button"]')) return;
++      if (/\b(?:profile (?:picture|photo)|profilov[áa] (?:fotka|fotografie)|avatar)\b/iu.test(label || '')) return;
++      const semanticContainer = node.closest('[dir="auto"]');
++      const semanticContainerText = cleanDisplayText(semanticContainer?.textContent);
++      if (semanticContainerText && isNonMessageRowText(semanticContainerText)) return;
++      if (/\p{Extended_Pictographic}/u.test(label || '')
++        && textNodes.some((textNode) => isReactionRowText(textNode.textContent))) return;
++      const canBeMessageContent = Boolean(semanticContainer)
++        || /^(?:photo|video|gif|sticker|voice message|audio|file|fotka|fotografie|video|gif|samolepka|hlasová zpráva|zvuk|soubor)\b/iu.test(label || '');
++      if (!canBeMessageContent) return;
++      pushDisplayPart(parts, seen, label, { dedupe: true });
++    });
++
++    if (parts.length < 2) {
++      const label = cleanDisplayText(link.getAttribute('aria-label'));
++      const unreadLabel = label.match(/^(.*?)(?:\s*[·\-–—]\s*|\s+)?(?:unread message|nepřečtená zpráva)\s*:\s*(.+)$/iu);
++      if (unreadLabel) {
++        pushDisplayPart(parts, seen, unreadLabel[1], { dedupe: true });
++        pushDisplayPart(parts, seen, unreadLabel[2], { dedupe: true });
++      }
++    }
++
+     if (parts.length === 0) {
+-      const linkLabel = link.getAttribute('aria-label');
+-      const text = normalizeText(linkLabel || link.textContent);
+-      if (text) parts.push(text);
++      pushDisplayPart(parts, seen, link.innerText || link.textContent, { dedupe: true });
+     }
+-    return parts.join('\u001f').slice(0, 1024);
++    return { calendarFlags, parts, textNodes };
++  }
++
++  const isIncomingMessageBody = (body) => {
++    const normalized = normalizeText(body);
++    if (!normalized || isNonMessageRowText(body)) return false;
++    return !/^(?:(?:ja|you|vy)\s*:|you sent\b|odeslali jste\b|poslali jste\b|poslal\(a\) jste\b)/i.test(normalized);
++  };
++
++  function rowMessageState(link, threadId, { allowStrongTrailingMessage = false } = {}) {
++    const { calendarFlags, parts, textNodes } = rowDisplayState(link, {
++      allowStrongTrailingMessage,
++    });
++    const hasTransientSemanticText = textNodes.some((node, index) => (
++      isNonMessageRowText(node.textContent)
++      || calendarFlags[index]
++    ));
++    if (parts.length < 2) {
++      const signature = parts.map(normalizeText).join('\u001f').slice(0, 1024);
++      const incoming = !hasTransientSemanticText
++        && Boolean(signature)
++        && isIncomingMessageBody(parts[0]);
++      return {
++        fallbackOnly: true,
++        incoming,
++        message: incoming
++          ? {
++            threadId,
++            encrypted: link.pathname.startsWith('/messages/e2ee/t/'),
++            title: 'Messenger',
++            body: 'Nová zpráva',
++          }
++          : null,
++        signature,
++        substantive: incoming,
++      };
++    }
++
++    let encrypted = false;
++    try {
++      encrypted = new URL(link.getAttribute('href'), window.location.href)
++        .pathname.startsWith('/messages/e2ee/t/');
++    } catch {
++      return {
++        fallbackOnly: true,
++        incoming: false,
++        message: null,
++        signature: parts.map(normalizeText).join('\u001f').slice(0, 1024),
++        substantive: true,
++      };
++    }
++
++    const title = parts[0];
++    const bodyParts = [];
++    const seenBodyParts = new Set();
++    parts.slice(1).forEach((part) => {
++      const key = normalizeText(part);
++      if (!key || seenBodyParts.has(key)) return;
++      seenBodyParts.add(key);
++      bodyParts.push(part);
++    });
++    const body = bodyParts.join(' · ');
++    const signature = [parts[0], ...bodyParts]
++      .map(normalizeText)
++      .join('\u001f')
++      .slice(0, 1024);
++    const onlySenderPrefixes = bodyParts.length > 0
++      && bodyParts.every((part) => /:\s*$/u.test(part));
++    const transientSenderOnly = hasTransientSemanticText && onlySenderPrefixes;
++    const incoming = !transientSenderOnly && isIncomingMessageBody(body);
++
++    return {
++      fallbackOnly: false,
++      incoming,
++      message: incoming
++        ? {
++          threadId,
++          encrypted,
++          title: title || 'Messenger',
++          body: body || 'Nová zpráva',
++        }
++        : null,
++      signature,
++      substantive: Boolean(body) && !transientSenderOnly,
++    };
+   }
+ 
+   const compactTextNodes = (link) => Array.from(link.querySelectorAll('[dir="auto"]'))
+     .filter((node) => !node.querySelector('img, svg'));
+ 
+-  function setupUnreadTracker(nav, onSnapshot) {
++  function setupUnreadTracker(nav, onSnapshot, { handoffSnapshot = null } = {}) {
+     const threadState = new Map();
+     const linkIdentity = new WeakMap();
+     const dirtyIds = new Set();
+     const notificationEligibleIds = new Set();
+     const pendingNotifications = new Map();
++    const pendingReadNotifications = new Map();
+     const identityRefreshState = new WeakMap();
+     const identityRefreshStates = new Set();
++    const identityCandidates = new Map();
++    const identitySettledIds = new Set();
++    const transferredStates = handoffSnapshot?.states instanceof Map
++      ? new Map(handoffSnapshot.states)
++      : new Map();
++    const transferredPendingNotifications = handoffSnapshot?.pendingNotifications instanceof Map
++      ? new Map(handoffSnapshot.pendingNotifications)
++      : new Map();
++    const transferredPendingReadNotifications = handoffSnapshot?.pendingReadNotifications instanceof Map
++      ? new Map(handoffSnapshot.pendingReadNotifications)
++      : new Map();
++    const handoffForegroundEpoch = Number.isSafeInteger(handoffSnapshot?.foregroundEpoch)
++      ? handoffSnapshot.foregroundEpoch
++      : foregroundEpoch;
+     const SIGNATURE_STABILITY_MS = 180;
+     const IDENTITY_REFRESH_QUIET_MS = 750;
+     const MISSING_COUNT_GRACE_MS = 1000;
++    const READ_MARKER_LAG_MS = 1000;
++    const UNKNOWN_THREAD_BASELINE_MS = 1500;
++    const UNKNOWN_TITLE_CORROBORATION_MS = 2000;
++    const UNKNOWN_IDENTITY_SETTLE_MS = UNKNOWN_TITLE_CORROBORATION_MS;
++    const trackerStartedAt = performance.now();
+     let flushScheduled = false;
+     let missingExpiryTimer = null;
+     let disposed = false;
+     let lastReportedCount = null;
++    let lastReportedPresentCount = null;
+ 
+     const currentCount = () => {
+       let count = 0;
+@@ -690,11 +989,66 @@ window.addEventListener('DOMContentLoaded', () => {
+       return Math.min(count, 9999);
+     };
+ 
++    const currentPresentCount = () => {
++      let count = 0;
++      threadState.forEach((state) => {
++        if (state.unread && state.present !== false && state.counted !== false) count += 1;
++      });
++      return Math.min(count, 9999);
++    };
++
++    const expireKnownTitleExpectations = (now = performance.now()) => {
++      for (let index = pendingKnownTitleExpectations.length - 1; index >= 0; index -= 1) {
++        const expectation = pendingKnownTitleExpectations[index];
++        if (now - expectation.at <= UNKNOWN_TITLE_CORROBORATION_MS) continue;
++        if (expectation.disputedGeneration) {
++          // No later title increase arrived for the known DOM transition. The
++          // disputed increase therefore belongs to that known message, not to
++          // a provisional row which happened to hydrate at the same time.
++          claimTitleIncrease(expectation.disputedGeneration);
++        }
++        pendingKnownTitleExpectations.splice(index, 1);
++      }
++    };
++
++    const noteKnownDomMessage = () => {
++      const now = performance.now();
++      expireKnownTitleExpectations(now);
++      const generation = latestTitleIncrease.generation;
++      const supportedUnknownCandidates = [...identityCandidates.values()]
++        .filter((candidate) => candidate.unknownCandidate
++          && candidate.titleCorroborated
++          && candidate.titleIncreaseGeneration === generation);
++      if (supportedUnknownCandidates.length > 0
++        && now - latestTitleIncrease.at <= UNKNOWN_TITLE_CORROBORATION_MS
++        && !titleIncreaseIsUnavailable(generation)) {
++        pendingKnownTitleExpectations.push({
++          afterGeneration: generation,
++          at: now,
++          disputedGeneration: generation,
++        });
++        supportedUnknownCandidates.forEach((candidate) => candidate.wake?.());
++        return;
++      }
++      if (supportedUnknownCandidates.length === 0
++        && !titleIncreaseIsUnavailable(generation)
++        && now - latestTitleIncrease.at <= UNKNOWN_TITLE_CORROBORATION_MS) {
++        claimTitleIncrease(generation);
++        return;
++      }
++      pendingKnownTitleExpectations.push({
++        afterGeneration: generation,
++        at: now,
++      });
++    };
++
+     const publishCountIfChanged = () => {
+       const count = currentCount();
+-      if (count === lastReportedCount) return;
++      const presentCount = currentPresentCount();
++      if (count === lastReportedCount && presentCount === lastReportedPresentCount) return;
+       lastReportedCount = count;
+-      onSnapshot({ count, notify: false });
++      lastReportedPresentCount = presentCount;
++      onSnapshot({ count, notify: false, presentCount });
+     };
+ 
+     function scheduleMissingExpiry() {
+@@ -801,6 +1155,11 @@ window.addEventListener('DOMContentLoaded', () => {
+         const pending = pendingNotifications.get(evictedId);
+         if (pending) clearTimeout(pending.timer);
+         pendingNotifications.delete(evictedId);
++        const pendingRead = pendingReadNotifications.get(evictedId);
++        if (pendingRead) clearTimeout(pendingRead.timer);
++        pendingReadNotifications.delete(evictedId);
++        identityCandidates.delete(evictedId);
++        identitySettledIds.delete(evictedId);
+         threadState.delete(evictedId);
+       }
+     };
+@@ -811,20 +1170,83 @@ window.addEventListener('DOMContentLoaded', () => {
+       pendingNotifications.delete(id);
+     };
+ 
+-    const signatureIsSubstantive = (signature) => signature.includes('\u001f');
++    const cancelPendingReadNotification = (id) => {
++      const pending = pendingReadNotifications.get(id);
++      if (pending) clearTimeout(pending.timer);
++      pendingReadNotifications.delete(id);
++    };
+ 
+-    const scheduleStableNotification = (id, signature, crossSourceExempt = false) => {
+-      cancelPendingNotification(id);
++    const appIsBackgrounded = () => document.visibilityState === 'hidden'
++      || !document.hasFocus();
++
++    const scheduleReadCandidateExpiry = (id, signature, {
++      deadline = performance.now() + READ_MARKER_LAG_MS,
++      scheduledForegroundEpoch = foregroundEpoch,
++    } = {}) => {
++      cancelPendingReadNotification(id);
++      if (scheduledForegroundEpoch !== foregroundEpoch || !appIsBackgrounded()) return;
+       const timer = setTimeout(() => {
+-        pendingNotifications.delete(id);
++        pendingReadNotifications.delete(id);
++      }, Math.max(0, Math.ceil(deadline - performance.now())));
++      pendingReadNotifications.set(id, {
++        deadline,
++        foregroundEpoch: scheduledForegroundEpoch,
++        signature,
++        timer,
++      });
++    };
++
++    const scheduleStableNotification = (id, signature, {
++      deadline = performance.now() + SIGNATURE_STABILITY_MS,
++      scheduledForegroundEpoch = foregroundEpoch,
++    } = {}) => {
++      cancelPendingNotification(id);
++      if (scheduledForegroundEpoch !== foregroundEpoch || !appIsBackgrounded()) return;
++      const pending = {
++        deadline,
++        foregroundEpoch: scheduledForegroundEpoch,
++        signature,
++        timer: null,
++      };
++      const check = () => {
++        if (pendingNotifications.get(id) !== pending) return;
+         const current = threadState.get(id);
+-        if (!current?.unread
++        if (current?.present === false
++          && current.counted !== false
++          && Number.isFinite(current.missingSince)) {
++          const remaining = MISSING_COUNT_GRACE_MS - (performance.now() - current.missingSince);
++          if (remaining > 0) {
++            pending.timer = setTimeout(check, Math.max(1, Math.ceil(remaining)));
++            return;
++          }
++        }
++        pendingNotifications.delete(id);
++        if (scheduledForegroundEpoch !== foregroundEpoch
++          || !appIsBackgrounded()
++          || !current?.unread
+           || current.present === false
+           || current.counted === false
+           || current.signature !== signature) return;
+-        onSnapshot({ count: currentCount(), notify: true, crossSourceExempt });
+-      }, SIGNATURE_STABILITY_MS);
+-      pendingNotifications.set(id, { signature, timer });
++        onSnapshot({
++          count: currentCount(),
++          notify: true,
++          message: current.message,
++          presentCount: currentPresentCount(),
++        });
++      };
++      pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
++      pendingNotifications.set(id, pending);
++    };
++
++    const cancelPendingNotificationsForForeground = () => {
++      pendingNotifications.forEach(({ timer }) => clearTimeout(timer));
++      pendingNotifications.clear();
++      pendingReadNotifications.forEach(({ timer }) => clearTimeout(timer));
++      pendingReadNotifications.clear();
++      threadState.forEach((state) => {
++        state.pendingReadSignature = null;
++        state.pendingReadUntil = -Infinity;
++      });
+     };
+ 
+     const markDirty = (id, { notificationEligible = false } = {}) => {
+@@ -833,20 +1255,94 @@ window.addEventListener('DOMContentLoaded', () => {
+       if (notificationEligible) notificationEligibleIds.add(id);
+     };
+ 
++    const ownsTitleIncrease = (id, candidate) => {
++      expireKnownTitleExpectations();
++      const generation = candidate?.titleIncreaseGeneration || 0;
++      if (!candidate?.titleCorroborated
++        || titleIncreaseIsUnavailable(generation)) return false;
++      if (pendingKnownTitleExpectations.some((expectation) => (
++        expectation.disputedGeneration === generation
++      ))) return false;
++
++      const contenders = [...identityCandidates.entries()]
++        .filter(([, other]) => other.unknownCandidate
++          && other.titleCorroborated
++          && other.titleIncreaseGeneration === generation);
++      const topId = threadIdentity(nav.querySelector(THREAD_LINK_SELECTOR));
++      const topContender = contenders.find(([candidateId]) => candidateId === topId);
++      if (topContender) return topContender[0] === id;
++      const newest = contenders.reduce((best, entry) => (
++        !best || entry[1].createdAt > best[1].createdAt ? entry : best
++      ), null);
++      return newest?.[0] === id;
++    };
++
+     const rememberLink = (link, reasons) => {
+       if (!(link instanceof Element) || !link.matches(THREAD_LINK_SELECTOR)) return;
+       const previousId = linkIdentity.get(link);
+       const nextId = threadIdentity(link);
+       if (previousId) markDirty(previousId, reasons);
+       if (nextId) {
+-        const existingState = threadState.get(nextId);
+-        if (existingState
+-          && (existingState.present === false || reasons?.identityHydration === true)) {
++        let existingState = threadState.get(nextId);
++        let importedHandoff = false;
++        const handoffStillValid = performance.now()
++          <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
++        if (!existingState && handoffStillValid && transferredStates.has(nextId)) {
++          const transferred = transferredStates.get(nextId);
++          transferredStates.delete(nextId);
++          existingState = {
++            ...transferred,
++            counted: true,
++            missingSince: null,
++            pendingReadSignature: null,
++            pendingReadUntil: -Infinity,
++            present: true,
++          };
++          touchState(nextId, existingState);
++          importedHandoff = true;
++        }
++        const singleTopBackgroundCandidate = reasons?.allowUnknownCandidate === true
++          && threadState.size > 0
++          && performance.now() - trackerStartedAt >= UNKNOWN_THREAD_BASELINE_MS
++          && nav.querySelector(THREAD_LINK_SELECTOR) === link
++          && (document.visibilityState === 'hidden' || !document.hasFocus());
++        const allowUnknownCandidate = !existingState && singleTopBackgroundCandidate;
++        const allowReturningUnreadCandidate = existingState?.present === false
++          && existingState.unread === true
++          && existingState.stable === true
++          && singleTopBackgroundCandidate;
++        if (importedHandoff) {
++          refreshIdentityHydration(link, {
++            allowCandidate: true,
++            handoffCandidate: true,
++            settleDelayMs: IDENTITY_REFRESH_QUIET_MS,
++          });
++          const candidate = identityCandidates.get(nextId);
++          if (candidate) {
++            candidate.handoffForegroundEpoch = handoffForegroundEpoch;
++            candidate.handoffPendingNotification = transferredPendingNotifications.get(nextId) || null;
++            candidate.handoffPendingReadNotification = transferredPendingReadNotifications.get(nextId) || null;
++          }
++          transferredPendingNotifications.delete(nextId);
++          transferredPendingReadNotifications.delete(nextId);
++        } else if (existingState?.present === false
++          || (reasons?.identityHydration === true
++            && (Boolean(existingState) || allowUnknownCandidate))) {
+           // A virtualized/tombstoned row can hydrate its preview in a later
+           // mutation. The same applies when React replaces a known row within
+           // one observer batch, before it can be marked missing. Treat both
+           // sequences like identity reuse so they stay silent until settled.
+-          refreshIdentityHydration(link);
++          refreshIdentityHydration(link, {
++            allowCandidate: Boolean(existingState)
++              ? (existingState.present !== false
++                || existingState.unread === false
++                || allowReturningUnreadCandidate)
++              : allowUnknownCandidate,
++            unknownCandidate: allowUnknownCandidate,
++            settleDelayMs: allowUnknownCandidate
++              ? UNKNOWN_IDENTITY_SETTLE_MS
++              : IDENTITY_REFRESH_QUIET_MS,
++          });
+         }
+         markDirty(nextId, reasons);
+         linkIdentity.set(link, nextId);
+@@ -893,7 +1389,8 @@ window.addEventListener('DOMContentLoaded', () => {
+       for (const id of dirtyIds) {
+         const allLinks = groups.get(id);
+         if (!allLinks?.length) {
+-          cancelPendingNotification(id);
++          identityCandidates.delete(id);
++          identitySettledIds.delete(id);
+           const previous = threadState.get(id);
+           if (previous && previous.present !== false) {
+             // Keep the last signature briefly so ordinary list virtualization
+@@ -920,10 +1417,48 @@ window.addEventListener('DOMContentLoaded', () => {
+         const links = visibleLinks.length > 0 ? visibleLinks : measuredLinks;
+         const unreadLinks = links.filter((entry) => entry.unread).map((entry) => entry.link);
+         const unread = unreadLinks.length > 0;
+-        const signature = unread
+-          ? [...new Set(unreadLinks.map(rowSignature).filter(Boolean))].sort().join('\u001e').slice(0, 2048)
+-          : '';
+-        measuredGroups.set(id, { measuredLinks, signature, unread });
++        const contentLinks = unread
++          ? unreadLinks
++          : links.map((entry) => entry.link);
++        const previousState = threadState.get(id);
++        const allowStrongTrailingMessage = notificationEligibleIds.has(id)
++          && previousState?.stable === true;
++        const messageStates = contentLinks.map((link) => rowMessageState(link, id, {
++          allowStrongTrailingMessage,
++        }));
++        const substantiveState = messageStates.find((state) => state.substantive) || null;
++        const signature = [...new Set(messageStates.map((state) => state.signature).filter(Boolean))]
++          .sort()
++          .join('\u001e')
++          .slice(0, 2048);
++        measuredGroups.set(id, {
++          fallbackOnly: substantiveState?.fallbackOnly === true,
++          incoming: substantiveState?.incoming === true,
++          measuredLinks,
++          message: substantiveState?.message || null,
++          signature,
++          substantive: substantiveState !== null,
++          unread,
++        });
++
++        const identityCandidate = identityCandidates.get(id);
++        if (identityCandidate) {
++          if (!identityCandidate.firstObserved) {
++            identityCandidate.firstObserved = {
++              confirmed: substantiveState !== null
++                && substantiveState.fallbackOnly !== true,
++              signature,
++              substantive: substantiveState !== null,
++              unread,
++            };
++          }
++          identityCandidate.latest = {
++            incoming: substantiveState?.incoming === true,
++            signature,
++            substantive: substantiveState !== null,
++            unread,
++          };
++        }
+       }
+ 
+       measuredGroups.forEach(({ measuredLinks }) => {
+@@ -933,55 +1468,184 @@ window.addEventListener('DOMContentLoaded', () => {
+         });
+       });
+ 
+-      for (const [id, { signature, unread }] of measuredGroups) {
++      for (const [id, {
++        fallbackOnly,
++        incoming,
++        message,
++        signature,
++        substantive,
++        unread,
++      }] of measuredGroups) {
+         const previous = threadState.get(id);
+         const notificationEligible = notificationEligibleIds.has(id);
+-        const substantiveSignature = unread && signatureIsSubstantive(signature);
+-        let stable = !unread || substantiveSignature;
++        const identitySettled = identitySettledIds.delete(id);
++        const identityCandidate = identityCandidates.get(id);
++        const incompleteFallback = Boolean(previous?.stable
++          && fallbackOnly
++          && signature
++          && (previous.signature === signature
++            || previous.signature.startsWith(`${signature}\u001f`)));
++        const observedSubstantive = substantive && !incompleteFallback;
++        let nextIncoming = incoming;
++        let nextMessage = message;
++        let nextSignature = signature;
++        let stable = observedSubstantive && !fallbackOnly;
+         let pendingUnreadTransition = false;
++        let pendingReadSignature = previous?.pendingReadUntil > performance.now()
++          ? previous.pendingReadSignature
++          : null;
++        let pendingReadUntil = pendingReadSignature ? previous.pendingReadUntil : -Infinity;
+         if (previous) {
++          if (unread) cancelPendingReadNotification(id);
+           if (!unread) {
+             cancelPendingNotification(id);
+-          } else if (!previous.unread && notificationEligible) {
+-            pendingUnreadTransition = true;
+-            if (substantiveSignature) {
+-              scheduleStableNotification(id, signature);
+-              pendingUnreadTransition = false;
++            if (!observedSubstantive) {
++              nextIncoming = previous.incoming;
++              nextMessage = previous.message;
++              nextSignature = previous.signature;
++              stable = previous.stable;
++            } else {
++              // The first substantive preview after a startup skeleton is the
++              // row's baseline, not a newly received message.
++              const changedWhileRead = previous.stable === true
++                && !previous.unread
++                && Boolean(signature)
++                && previous.signature !== signature;
++              const handoffReadTransition = identitySettled
++                && identityCandidate?.handoffCandidate
++                && identityCandidate.baseline?.stable === true
++                && identityCandidate.baseline.signature !== signature
++                && incoming;
++              const transferredReadIntent = identitySettled
++                && identityCandidate?.handoffCandidate
++                && identityCandidate.handoffPendingReadNotification?.signature === signature
++                && incoming;
++              if ((handoffReadTransition || transferredReadIntent) && appIsBackgrounded()) {
++                const transferredIntent = identityCandidate.handoffPendingReadNotification;
++                pendingReadSignature = signature;
++                pendingReadUntil = performance.now() + READ_MARKER_LAG_MS;
++                scheduleReadCandidateExpiry(id, signature, {
++                  deadline: transferredReadIntent
++                    ? transferredIntent.deadline
++                    : pendingReadUntil,
++                  scheduledForegroundEpoch: transferredReadIntent
++                    ? transferredIntent.foregroundEpoch
++                    : identityCandidate.handoffForegroundEpoch,
++                });
++              } else if (changedWhileRead
++                && notificationEligible
++                && incoming
++                && appIsBackgrounded()) {
++                pendingReadSignature = signature;
++                pendingReadUntil = performance.now() + READ_MARKER_LAG_MS;
++                scheduleReadCandidateExpiry(id, signature);
++              } else if (previous.unread || changedWhileRead) {
++                pendingReadSignature = null;
++                pendingReadUntil = -Infinity;
++                cancelPendingReadNotification(id);
++              }
+             }
+-          } else if (previous.unread && unread) {
+-            pendingUnreadTransition = previous.pendingUnreadTransition === true;
+-            const changedSignature = previous.signature
+-              && signature
+-              && previous.signature !== signature;
+-            if (!previous.stable) {
+-              if (substantiveSignature) {
+-                // The first complete preview after an initial skeleton is part
+-                // of baseline hydration. Only a prior read->unread transition
+-                // may turn it into a notification.
+-                if (pendingUnreadTransition) scheduleStableNotification(id, signature);
+-                pendingUnreadTransition = false;
+-              } else {
+-                cancelPendingNotification(id);
++          } else if (!observedSubstantive) {
++            // Typing, timestamps, read receipts, reactions, and temporary
++            // skeletons must not replace the last real preview. Keeping it also
++            // lets an already-scheduled message survive a brief typing update.
++            nextIncoming = previous.incoming;
++            nextMessage = previous.message;
++            nextSignature = previous.signature;
++            stable = previous.stable;
++            pendingUnreadTransition = previous.pendingUnreadTransition === true
++              || (!previous.unread && notificationEligible);
++          } else {
++            const changedSignature = Boolean(signature) && previous.signature !== signature;
++            const baselineHydration = previous.unread
++              && !previous.stable
++              && previous.pendingUnreadTransition !== true;
++            const readPreviewLed = (!previous.unread
++              || previous.pendingUnreadTransition === true)
++              && previous.pendingReadSignature === signature
++              && previous.pendingReadUntil >= performance.now();
++            const shouldNotify = incoming
++              && ((notificationEligible
++                && changedSignature
++                && !baselineHydration)
++                || readPreviewLed);
++            const identityBaselineChanged = identitySettled
++              && identityCandidate
++              && (identityCandidate.baseline
++                ? identityCandidate.baseline.signature !== signature
++                : (identityCandidate.unknownCandidate && Boolean(signature)));
++            const handoffTransitionEligible = identityBaselineChanged
++              && identityCandidate?.handoffCandidate
++              && identityCandidate.baseline?.stable === true
++              && incoming;
++            const identityTransitionEligible = identityBaselineChanged
++              && unread
++              && incoming
++              && (identityCandidate.baseline
++                ? (identityCandidate.handoffCandidate
++                  || identityCandidate.baseline.unread === false
++                  || (identityCandidate.firstObserved?.confirmed === true
++                    && identityCandidate.firstObserved.signature
++                      !== identityCandidate.baseline.signature))
++                : (identityCandidate.firstObserved?.confirmed === true
++                  && ownsTitleIncrease(id, identityCandidate)));
++
++            const transferredStableIntent = identitySettled
++              && identityCandidate?.handoffCandidate
++              && identityCandidate.handoffPendingNotification?.signature === signature
++              && unread
++              && incoming;
++
++            if (shouldNotify || identityTransitionEligible || transferredStableIntent) {
++              const knownUnreadCountIncrease = unread
++                && ((shouldNotify && previous.unread === false)
++                  || (identityTransitionEligible
++                    && identityCandidate?.baseline?.unread === false));
++              if (knownUnreadCountIncrease) noteKnownDomMessage();
++              if (identityTransitionEligible
++                && !identityCandidate.baseline
++                && identityCandidate.titleIncreaseGeneration) {
++                claimTitleIncrease(identityCandidate.titleIncreaseGeneration);
+               }
+-            } else if (changedSignature && notificationEligible && substantiveSignature) {
+-              scheduleStableNotification(id, signature, true);
+-            } else if (changedSignature && !substantiveSignature) {
+-              // Ignore temporary name-only/empty hydration states and wait for
+-              // the final preview before deciding.
++              const transferredIntent = identityCandidate?.handoffPendingNotification;
++              const candidateForegroundEpoch = identityCandidate?.handoffCandidate
++                ? identityCandidate.handoffForegroundEpoch
++                : identityCandidate?.createdForegroundEpoch;
++              scheduleStableNotification(id, signature, (identityTransitionEligible
++                || handoffTransitionEligible
++                || transferredStableIntent) ? {
++                  deadline: transferredStableIntent
++                    ? transferredIntent.deadline
++                    : performance.now() + SIGNATURE_STABILITY_MS,
++                  scheduledForegroundEpoch: transferredStableIntent
++                    ? transferredIntent.foregroundEpoch
++                    : candidateForegroundEpoch,
++                } : undefined);
++            } else if (changedSignature) {
++              // A stable outgoing/system preview supersedes any older pending
++              // incoming candidate. The timer also rechecks the signature.
+               cancelPendingNotification(id);
+             }
+-            stable = previous.stable || substantiveSignature;
++            stable = true;
++            pendingUnreadTransition = false;
++            pendingReadSignature = null;
++            pendingReadUntil = -Infinity;
+           }
+         }
+         touchState(id, {
++          incoming: nextIncoming,
+           unread,
+-          signature,
++          signature: nextSignature,
+           stable,
+           pendingUnreadTransition,
+           present: true,
+           counted: true,
+           missingSince: null,
++          message: nextMessage,
++          pendingReadSignature,
++          pendingReadUntil,
+         });
++        if (identitySettled) identityCandidates.delete(id);
+       }
+       trimState();
+       dirtyIds.clear();
+@@ -996,21 +1660,123 @@ window.addEventListener('DOMContentLoaded', () => {
+       queueMicrotask(flush);
+     };
+ 
+-    const refreshIdentityHydration = (link) => {
++    const refreshIdentityHydration = (link, {
++      allowCandidate = false,
++      handoffCandidate = false,
++      suppressCandidate = false,
++      unknownCandidate = false,
++      settleDelayMs = IDENTITY_REFRESH_QUIET_MS,
++    } = {}) => {
++      const id = threadIdentity(link);
++      if (suppressCandidate && id) identityCandidates.delete(id);
++      if (allowCandidate && id && !identityCandidates.has(id)) {
++        const baseline = threadState.get(id);
++        const candidateCreatedAt = performance.now();
++        const recentTitleIncrease = candidateCreatedAt - latestTitleIncrease.at
++          <= UNKNOWN_TITLE_CORROBORATION_MS
++          && !titleIncreaseIsUnavailable(latestTitleIncrease.generation);
++        const titleIncreaseGeneration = unknownCandidate && recentTitleIncrease
++          ? latestTitleIncrease.generation
++          : 0;
++        identityCandidates.set(id, {
++          baseline: baseline
++            ? {
++              present: baseline.present,
++              signature: baseline.signature,
++              stable: baseline.stable,
++              unread: baseline.unread,
++            }
++            : null,
++          firstObserved: null,
++          latest: null,
++          unknownCandidate,
++          createdAt: candidateCreatedAt,
++          createdForegroundEpoch: foregroundEpoch,
++          handoffCandidate,
++          handoffForegroundEpoch: foregroundEpoch,
++          handoffPendingNotification: null,
++          handoffPendingReadNotification: null,
++          settleNotBefore: candidateCreatedAt + settleDelayMs,
++          titleCorroborated: titleIncreaseGeneration > 0,
++          titleCorroboratedAt: titleIncreaseGeneration > 0
++            ? latestTitleIncrease.at
++            : -Infinity,
++          titleIncreaseGeneration,
++          wake: null,
++        });
++      }
++
+       let state = identityRefreshState.get(link);
+       if (!state) {
+-        state = { active: true, timer: null };
++        state = {
++          active: true,
++          id,
++          settleDelayMs,
++          settleNotBefore: performance.now() + settleDelayMs,
++          timer: null,
++          wake: null,
++        };
+         identityRefreshState.set(link, state);
+         identityRefreshStates.add(state);
+       }
++      state.id = id;
+       state.active = true;
+-      if (state.timer !== null) clearTimeout(state.timer);
+-      state.timer = setTimeout(() => {
+-        state.active = false;
++      state.settleDelayMs = Math.max(
++        state.settleDelayMs || IDENTITY_REFRESH_QUIET_MS,
++        settleDelayMs,
++      );
++      state.settleNotBefore = performance.now() + state.settleDelayMs;
++      const settle = () => {
+         state.timer = null;
++        const now = performance.now();
++        expireKnownTitleExpectations(now);
++        const candidate = identityCandidates.get(state.id);
++        const dispute = candidate?.titleIncreaseGeneration
++          ? pendingKnownTitleExpectations.find((expectation) => (
++            expectation.disputedGeneration === candidate.titleIncreaseGeneration
++          ))
++          : null;
++        const titleDecisionDeadline = candidate?.titleCorroborated
++          ? candidate.titleCorroboratedAt + UNKNOWN_TITLE_CORROBORATION_MS
++          : -Infinity;
++        const disputeDeadline = dispute
++          ? dispute.at + UNKNOWN_TITLE_CORROBORATION_MS
++          : -Infinity;
++        const settleNotBefore = Math.max(
++          state.settleNotBefore,
++          candidate?.settleNotBefore || -Infinity,
++          titleDecisionDeadline,
++          disputeDeadline,
++        );
++        if (!disposed && now < settleNotBefore) {
++          state.timer = setTimeout(settle, Math.max(1, Math.ceil(settleNotBefore - now)));
++          return;
++        }
++
++        state.active = false;
+         identityRefreshStates.delete(state);
+         identityRefreshState.delete(link);
+-      }, IDENTITY_REFRESH_QUIET_MS);
++        const settledId = threadIdentity(link);
++        if (!disposed
++          && settledId
++          && settledId === state.id
++          && link.isConnected
++          && nav.contains(link)
++          && identityCandidates.has(settledId)) {
++          identitySettledIds.add(settledId);
++          markDirty(settledId);
++          scheduleFlush();
++        } else if (state.id) {
++          identityCandidates.delete(state.id);
++        }
++      };
++      state.wake = () => {
++        if (state.timer !== null) clearTimeout(state.timer);
++        state.timer = setTimeout(settle, 0);
++      };
++      const candidate = identityCandidates.get(id);
++      if (candidate) candidate.wake = state.wake;
++      state.wake();
+     };
+ 
+     const closestTrackedAnchor = (node) => {
+@@ -1020,6 +1786,19 @@ window.addEventListener('DOMContentLoaded', () => {
+     };
+ 
+     const observer = new MutationObserver((mutations) => {
++      const addedThreadLinks = new Set();
++      mutations.forEach((mutation) => {
++        if (mutation.type !== 'childList') return;
++        mutation.addedNodes.forEach((node) => {
++          if (node?.nodeType !== Node.ELEMENT_NODE) return;
++          if (node.matches?.(THREAD_LINK_SELECTOR)) addedThreadLinks.add(node);
++          node.querySelectorAll?.(THREAD_LINK_SELECTOR).forEach((link) => addedThreadLinks.add(link));
++        });
++      });
++      const onlyAddedThreadLink = addedThreadLinks.size === 1
++        ? addedThreadLinks.values().next().value
++        : null;
++
+       for (const mutation of mutations) {
+         if (mutation.type !== 'attributes' || mutation.attributeName !== 'href') continue;
+         const link = closestTrackedAnchor(mutation.target);
+@@ -1027,13 +1806,17 @@ window.addEventListener('DOMContentLoaded', () => {
+         const previousId = linkIdentity.get(link);
+         const nextId = threadIdentity(link);
+         if (!previousId && !nextId) continue;
+-        refreshIdentityHydration(link);
++        if (previousId) identityCandidates.delete(previousId);
++        if (nextId) identityCandidates.delete(nextId);
++        refreshIdentityHydration(link, { suppressCandidate: true });
+         if (previousId) {
+           cancelPendingNotification(previousId);
++          cancelPendingReadNotification(previousId);
+           markDirty(previousId);
+         }
+         if (nextId) {
+           cancelPendingNotification(nextId);
++          cancelPendingReadNotification(nextId);
+           markDirty(nextId);
+         } else {
+           linkIdentity.delete(link);
+@@ -1069,6 +1852,8 @@ window.addEventListener('DOMContentLoaded', () => {
+               && (node.matches?.(THREAD_LINK_SELECTOR)
+                 || node.querySelector?.(THREAD_LINK_SELECTOR));
+             collectLinks(node, true, {
++              allowUnknownCandidate: node === onlyAddedThreadLink
++                || node.contains?.(onlyAddedThreadLink),
+               notificationEligible: false,
+               identityHydration: Boolean(addsThreadLink),
+             });
+@@ -1100,6 +1885,78 @@ window.addEventListener('DOMContentLoaded', () => {
+     flush();
+ 
+     return {
++      noteTitleHint() {
++        if (disposed) return;
++        const now = performance.now();
++        expireKnownTitleExpectations(now);
++        const knownExpectationIndex = pendingKnownTitleExpectations.findIndex((expectation) => (
++          latestTitleIncrease.at >= expectation.at
++          && latestTitleIncrease.generation > expectation.afterGeneration
++          && !titleIncreaseIsUnavailable(latestTitleIncrease.generation)
++        ));
++        if (knownExpectationIndex >= 0) {
++          const resolvedExpectation = pendingKnownTitleExpectations[knownExpectationIndex];
++          claimTitleIncrease(latestTitleIncrease.generation);
++          pendingKnownTitleExpectations.splice(knownExpectationIndex, 1);
++          identityCandidates.forEach((candidate) => {
++            if (candidate.titleIncreaseGeneration === resolvedExpectation.disputedGeneration) {
++              candidate.wake?.();
++            }
++          });
++          return;
++        }
++        for (const candidate of identityCandidates.values()) {
++          if (!candidate.unknownCandidate
++            || candidate.titleCorroborated
++            || now - candidate.createdAt > UNKNOWN_IDENTITY_SETTLE_MS
++            || titleIncreaseIsUnavailable(latestTitleIncrease.generation)
++            || latestTitleIncrease.generation <= candidate.titleIncreaseGeneration
++            || now - latestTitleIncrease.at > UNKNOWN_TITLE_CORROBORATION_MS) continue;
++          candidate.titleCorroborated = true;
++          candidate.titleCorroboratedAt = latestTitleIncrease.at;
++          candidate.titleIncreaseGeneration = latestTitleIncrease.generation;
++          candidate.settleNotBefore = Math.max(
++            candidate.settleNotBefore || -Infinity,
++            latestTitleIncrease.at + UNKNOWN_TITLE_CORROBORATION_MS,
++          );
++          candidate.wake?.();
++        }
++      },
++      cancelPendingNotificationsForForeground,
++      snapshotState() {
++        const cloneState = (state) => ({
++          ...state,
++          message: state.message ? { ...state.message } : null,
++        });
++        const clonePending = (pending) => ({
++          deadline: pending.deadline,
++          foregroundEpoch: pending.foregroundEpoch,
++          signature: pending.signature,
++        });
++        const states = new Map(
++          [...transferredStates].map(([id, state]) => [id, cloneState(state)]),
++        );
++        threadState.forEach((state, id) => states.set(id, cloneState(state)));
++        const pendingNotificationSnapshot = new Map(transferredPendingNotifications);
++        pendingNotifications.forEach((pending, id) => {
++          pendingNotificationSnapshot.set(id, clonePending(pending));
++        });
++        const pendingReadNotificationSnapshot = new Map(transferredPendingReadNotifications);
++        pendingReadNotifications.forEach((pending, id) => {
++          pendingReadNotificationSnapshot.set(id, clonePending(pending));
++        });
++        return {
++          capturedAt: transferredStates.size > 0
++            ? handoffSnapshot.capturedAt
++            : performance.now(),
++          foregroundEpoch: transferredStates.size > 0
++            ? handoffForegroundEpoch
++            : foregroundEpoch,
++          pendingNotifications: pendingNotificationSnapshot,
++          pendingReadNotifications: pendingReadNotificationSnapshot,
++          states,
++        };
++      },
+       cleanup() {
+         disposed = true;
+         observer.disconnect();
+@@ -1113,12 +1970,19 @@ window.addEventListener('DOMContentLoaded', () => {
+         notificationEligibleIds.clear();
+         pendingNotifications.forEach(({ timer }) => clearTimeout(timer));
+         pendingNotifications.clear();
++        pendingReadNotifications.forEach(({ timer }) => clearTimeout(timer));
++        pendingReadNotifications.clear();
+         if (missingExpiryTimer !== null) clearTimeout(missingExpiryTimer);
+         missingExpiryTimer = null;
+         identityRefreshStates.forEach(({ timer }) => {
+           if (timer !== null) clearTimeout(timer);
+         });
+         identityRefreshStates.clear();
++        identityCandidates.clear();
++        identitySettledIds.clear();
++        transferredStates.clear();
++        transferredPendingNotifications.clear();
++        transferredPendingReadNotifications.clear();
+         threadState.clear();
+       },
+     };
+@@ -1391,8 +2255,6 @@ window.addEventListener('DOMContentLoaded', () => {
+   let lastPublishedCount = null;
+   let lastBadgeCount = null;
+   let lastBadgeDataUrl = null;
+-  let lastNotifyAt = 0;
+-  let lastNotifySource = null;
+ 
+   function createBadgeDataUrl(count) {
+     if (count === lastBadgeCount) return lastBadgeDataUrl;
+@@ -1423,41 +2285,64 @@ window.addEventListener('DOMContentLoaded', () => {
+     return lastBadgeDataUrl;
+   }
+ 
+-  function publishCanonicalState(notify = false, source = 'structure', crossSourceExempt = false) {
+-    const count = latestTitleHint.available
+-      ? latestTitleHint.count
+-      : (domSnapshot?.count || 0);
+-    const now = performance.now();
+-    if (notify && !notificationBaselineReady) notify = false;
+-    if (notify
+-      && !crossSourceExempt
+-      && lastNotifySource
+-      && lastNotifySource !== source
+-      && now - lastNotifyAt < CROSS_SOURCE_NOTIFY_WINDOW_MS) {
+-      notify = false;
+-    }
+-
+-    if (!notify && count === lastPublishedCount) return;
++  function publishCanonicalState(
++    notify = false,
++    source = 'structure',
++    rawMessage = null,
++  ) {
++    const domCount = domSnapshot?.count || 0;
++    const titleCount = latestTitleHint.available ? latestTitleHint.count : null;
++    // A title prefix can lag behind a DOM message. For a notification event,
++    // never let a stale title count of zero erase the only toast/sound signal.
++    const count = notify && source === 'dom'
++      ? Math.max(domCount, titleCount || 0)
++      : (titleCount ?? domCount);
++    const message = notify && source === 'dom' ? rawMessage : null;
++    if (!notify && !message && count === lastPublishedCount) return;
+     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
+-    ipcRenderer.send('publish-unread-state', { count, notify, badgeDataUrl });
++    ipcRenderer.send('publish-unread-state', {
++      count,
++      notify,
++      badgeDataUrl,
++      message,
++    });
+     lastPublishedCount = count;
+-    if (notify && !crossSourceExempt) {
+-      lastNotifyAt = now;
+-      lastNotifySource = source;
+-    }
+   }
+ 
+-  handleTitleHint = (notify) => publishCanonicalState(notify, 'title');
++  // A title prefix has no sender or preview and can include non-message
++  // Facebook activity. Use it only to improve the badge count; native toasts
++  // and their sound require a DOM-confirmed conversation-row transition.
++  handleTitleHint = () => {
++    if (!latestTitleHint.available
++      && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
++      lastObservedTitleCount = 0;
++      retireTitleIncreasesThrough(latestTitleIncrease.generation);
++    }
++    unreadTracker?.noteTitleHint();
++    publishCanonicalState(false, 'title');
++  };
+ 
+   let activeNav = null;
+   let activeMain = null;
+   let unreadTracker = null;
+   let navControls = null;
++  let pendingHandoffSnapshot = null;
+   let structureTimerId = null;
+   let structureGapTimer = null;
+   let structureGapDeadline = -Infinity;
+   let structureGapGeneration = 0;
+   let pendingDomSnapshot = null;
++  const knownConversationNavs = new WeakSet(
++    document.querySelectorAll('[role="navigation"]'),
++  );
++
++  const handleAppForegrounded = () => {
++    if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
++    foregroundEpoch += 1;
++    unreadTracker?.cancelPendingNotificationsForForeground();
++  };
++  window.addEventListener('focus', handleAppForegrounded);
++  document.addEventListener('visibilitychange', handleAppForegrounded);
+ 
+   const clearStructureGap = () => {
+     structureGapGeneration += 1;
+@@ -1489,6 +2374,7 @@ window.addEventListener('DOMContentLoaded', () => {
+       }
+ 
+       domSnapshot = null;
++      pendingHandoffSnapshot = null;
+       publishCanonicalState(false, 'structure');
+     }, STRUCTURE_GAP_GRACE_MS);
+   };
+@@ -1502,10 +2388,21 @@ window.addEventListener('DOMContentLoaded', () => {
+     }
+     if (structureGapTimer !== null) clearStructureGap();
+     domSnapshot = snapshot;
+-    publishCanonicalState(snapshot.notify, 'dom', snapshot.crossSourceExempt === true);
++    if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
++      lastObservedTitleCount = 0;
++      retireTitleIncreasesThrough(latestTitleIncrease.generation);
++    }
++    publishCanonicalState(
++      snapshot.notify,
++      'dom',
++      snapshot.message,
++    );
+   };
+ 
+-  const unmountNav = (publishFallback = true) => {
++  const unmountNav = (publishFallback = true, retainHandoff = false) => {
++    pendingHandoffSnapshot = retainHandoff
++      ? unreadTracker?.snapshotState() || null
++      : null;
+     unreadTracker?.cleanup();
+     navControls?.cleanup();
+     unreadTracker = null;
+@@ -1524,12 +2421,13 @@ window.addEventListener('DOMContentLoaded', () => {
+ 
+   const mountNav = (nav) => {
+     activeNav = nav;
++    knownConversationNavs.add(nav);
+     const saved = loadState();
+     navControls = setupNavControls(nav, saved, scheduleStructure);
+     unreadTracker = setupUnreadTracker(nav, (snapshot) => {
+-      startNotificationBaselineCapture();
+       acceptDomSnapshot(snapshot);
+-    });
++    }, { handoffSnapshot: pendingHandoffSnapshot });
++    pendingHandoffSnapshot = null;
+   };
+ 
+   function reconcileStructure() {
+@@ -1542,7 +2440,7 @@ window.addEventListener('DOMContentLoaded', () => {
+ 
+     if (!nextNav || !nextMain) {
+       const preserveConnectedTracker = Boolean(activeNav?.isConnected);
+-      if (activeNav && !preserveConnectedTracker) unmountNav();
++      if (activeNav && !preserveConnectedTracker) unmountNav(true, true);
+       if (!activeNav || !activeMain?.isConnected) activeMain = null;
+       clearManagedLayout();
+       document.documentElement.classList.remove('messenger-app-mounted');
+@@ -1564,7 +2462,9 @@ window.addEventListener('DOMContentLoaded', () => {
+         // handoff from a nonzero list therefore needs the same fixed grace as
+         // a completely empty skeleton.
+         const replacementNeedsGrace = (domSnapshot?.count || 0) > 0;
+-        unmountNav(!activeNav.isConnected || replacementNeedsGrace);
++        const isNewReplacement = !knownConversationNavs.has(nextNav);
++        const retainHandoff = !activeNav.isConnected || isNewReplacement;
++        unmountNav(!activeNav.isConnected || replacementNeedsGrace, retainHandoff);
+       }
+       mountNav(nextNav);
+     }
