@@ -7,6 +7,7 @@ const {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   protocol,
   session,
   shell,
@@ -18,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const {
+  APP_USER_MODEL_ID,
   classifyNavigationUrl,
   createUsableBadgeImage,
   getTitleUnreadHint,
@@ -29,8 +31,10 @@ const {
   permitUnloadForApplicationQuit,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
+  TOAST_ACTIVATOR_CLSID,
   validateUnreadStatePayload,
 } = require('./lib/main-policy');
+const { createMessageNotificationManager } = require('./lib/message-notification-manager');
 
 const MESSENGER_URL = 'https://www.facebook.com/messages/';
 const MESSENGER_PARTITION = 'persist:messenger';
@@ -46,6 +50,10 @@ const userDataPath = path.join(app.getPath('appData'), 'MessengerApp');
 const settingsPath = path.join(userDataPath, 'settings.json');
 
 app.setPath('userData', userDataPath);
+if (process.platform === 'win32' && app.isPackaged) {
+  app.setAppUserModelId(APP_USER_MODEL_ID);
+  app.setToastActivatorCLSID(TOAST_ACTIVATOR_CLSID);
+}
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) app.quit();
@@ -244,6 +252,38 @@ function sendToMainWindow(channel, payload) {
   win.webContents.send(channel, payload);
 }
 
+function messageThreadUrl(message) {
+  const route = message.encrypted ? 'e2ee/t' : 't';
+  return `https://www.facebook.com/messages/${route}/${encodeURIComponent(message.threadId)}/`;
+}
+
+function navigateToMessageThread(win, message) {
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return;
+  const url = messageThreadUrl(message);
+  if (!isAllowedAppUrl(url)) return;
+
+  try {
+    const current = new URL(win.webContents.getURL());
+    const target = new URL(url);
+    if (current.origin === target.origin
+      && current.pathname.replace(/\/+$/, '') === target.pathname.replace(/\/+$/, '')) {
+      return;
+    }
+  } catch {
+    // A missing/incomplete current URL simply means the target should load.
+  }
+  void loadUrlWithRetry(win, url, []).catch((error) => {
+    console.warn('Could not navigate to message notification thread:', error.message);
+  });
+}
+
+const messageNotifications = createMessageNotificationManager({
+  NotificationClass: Notification,
+  isQuitting: () => isQuitting,
+  showWindow: showMainWindow,
+  navigateToThread: navigateToMessageThread,
+});
+
 function applyNativeUnreadState() {
   const win = getLiveMainWindow();
   const liveTray = getLiveTray();
@@ -296,6 +336,7 @@ ipcMain.on('publish-unread-state', (event, rawPayload) => {
   applyNativeUnreadState();
 
   if (payload.notify && !isMuted) sendToMainWindow('play-notification-sound');
+  if (payload.notify && payload.message) messageNotifications.show(payload.message);
 });
 
 async function getNotificationSoundPath() {
@@ -1027,6 +1068,15 @@ if (gotLock) {
   app.on('second-instance', showMainWindow);
 
   app.whenReady().then(() => {
+    if (process.platform === 'win32' && app.isPackaged) {
+      try {
+        // Initializes Electron's Windows toast presenter/shortcut integration
+        // before the first real message arrives.
+        Notification.isSupported();
+      } catch (error) {
+        console.warn('Could not initialize native notification support:', error.message);
+      }
+    }
     const messengerSession = session.fromPartition(MESSENGER_PARTITION);
     configureSessionPermissions(messengerSession);
     messengerSession.protocol.handle(CUSTOM_PROTOCOL, handleCustomAssetRequest);
@@ -1045,6 +1095,7 @@ if (gotLock) {
     // Clearing this flag prevents our later fallback from reviving quit state.
     restartPending = false;
     isQuitting = true;
+    messageNotifications.closeAll();
     cancelStartupUpdateCheck();
     if (quitFlushState === 'complete') return;
 
