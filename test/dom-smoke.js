@@ -60,11 +60,13 @@ function scheduleProfileCleanup() {
 
 const publishedStates = [];
 ipcMain.on('publish-unread-state', (_event, payload) => {
-  publishedStates.push({
+  const state = {
     count: payload?.count,
     notify: payload?.notify,
     hasBadge: typeof payload?.badgeDataUrl === 'string',
-  });
+  };
+  if (payload?.message) state.message = payload.message;
+  publishedStates.push(state);
 });
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -123,6 +125,10 @@ function fixtureHtml() {
             <img alt=""><span dir="auto">Bob</span><span dir="auto">Seen</span>
             <button data-testid="mark_unread" aria-label="Mark as unread"></button>
           </a>
+          <a id="startup-read-row" class="thread" href="https://www.facebook.com/messages/t/startup-read">
+            <img alt=""><span dir="auto">Startup</span><span id="startup-read-preview" dir="auto"></span>
+            <button aria-label="Mark as unread"></button>
+          </a>
           <button aria-label="Inbox switcher">Inbox</button>
         </nav>
         <main id="main" role="main">
@@ -145,12 +151,25 @@ async function run() {
     width: 1200,
     height: 800,
     webPreferences: {
+      backgroundThrottling: false,
       preload: path.join(__dirname, '..', 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
+  const executeJavaScript = win.webContents.executeJavaScript.bind(win.webContents);
+  let executedScriptCount = 0;
+  win.webContents.executeJavaScript = async (source, ...args) => {
+    executedScriptCount += 1;
+    try {
+      return await executeJavaScript(source, ...args);
+    } catch (error) {
+      const excerpt = String(source).replace(/\s+/g, ' ').trim().slice(0, 500);
+      throw new Error(`renderer script #${executedScriptCount} failed (${excerpt}): ${error.message}`);
+    }
+  };
+  let focusSink = null;
 
   try {
     await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(fixtureHtml())}`);
@@ -164,6 +183,155 @@ async function run() {
 
     const initial = publishedStates.findLast((state) => state.count === 1);
     assert.deepEqual(initial, { count: 1, notify: false, hasBadge: true });
+
+    // Meta can mount a read conversation as a name-only skeleton and hydrate
+    // its months-old preview afterward. A read row can be rehydrated more than
+    // once, but without an unread transition none of those changes is new.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#startup-read-preview').textContent = 'Zpráva před několika měsíci';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'startup hydration of an old read-row preview generated a notification',
+    );
+
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#startup-read-preview').textContent = 'Druhá fáze staré hydratace';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'later hydration of a stable read row generated a notification',
+    );
+
+    // Normal background unread transitions must still notify.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Background unread message';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.threadId === 'b'),
+      'background unread message was suppressed',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 1 && !state.notify),
+      'background message cleanup missing',
+    );
+
+    // A changed preview that remains read must not create a Windows toast the
+    // app cannot represent as unread. A following unread marker is tested
+    // separately below.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Background read-row message';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'background read-row change generated a toast without becoming unread',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+
+    // A read-row change observed while the user is actively looking at the
+    // app must not become a delayed toast merely because they alt-tab during
+    // the one-second unread-marker grace window.
+    win.show();
+    win.focus();
+    win.webContents.focus();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'visible' && document.hasFocus()`,
+    ), 'test window did not become focused');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Focused read-row change';
+    `);
+    await delay(150);
+    win.hide();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'hidden' || !document.hasFocus()`,
+    ), 'test window did not enter the background');
+    await delay(1050);
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      `focused read-row change notified after a later alt-tab: ${JSON.stringify(publishedStates)}`,
+    );
+    win.show();
+    focusSink = new BrowserWindow({
+      show: false,
+      frame: false,
+      skipTaskbar: true,
+      opacity: 0,
+      width: 1,
+      height: 1,
+      x: -32000,
+      y: -32000,
+    });
+    await focusSink.loadURL('data:text/html,<title>focus sink</title>');
+    focusSink.show();
+    focusSink.focus();
+    focusSink.webContents.focus();
+    await delay(250);
+    const backgroundRenderState = {
+      document: await win.webContents.executeJavaScript(`({
+        focus: document.hasFocus(),
+        visibility: document.visibilityState,
+      })`),
+      sinkFocused: focusSink.isFocused(),
+      windowFocused: win.isFocused(),
+      windowVisible: win.isVisible(),
+    };
+    assert.ok(
+      backgroundRenderState.document.visibility === 'visible'
+        && backgroundRenderState.document.focus === false,
+      `test window did not resume rendering in the background: ${JSON.stringify(backgroundRenderState)}`,
+    );
+
+    // The inverse focus race matters too: a read-row preview can change while
+    // hidden, then the user can inspect the app and hide it again before the
+    // one-second marker-lag timer expires. That already-observed message must
+    // not appear as a stale toast after the second background transition.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Interrupted background read-row message';
+    `);
+    await delay(150);
+    win.focus();
+    win.webContents.focus();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'visible' && document.hasFocus()`,
+    ), 'test window did not regain focus during the read-row grace');
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Foreground baseline after interruption';
+    `);
+    await delay(100);
+    focusSink.focus();
+    focusSink.webContents.focus();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'hidden' || !document.hasFocus()`,
+    ), 'test window did not return to the background');
+    await delay(1050);
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      `focus-interrupted read-row message generated a stale toast: ${JSON.stringify(publishedStates)}`,
+    );
+    await win.webContents.executeJavaScript(`document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen'`);
 
     const geometry = await win.webContents.executeJavaScript(`(() => {
       const viewport = window.visualViewport?.height || window.innerHeight;
@@ -352,6 +520,91 @@ async function run() {
     assert.equal(publishedStates.some((state) => state.count === 0), false, 'connected handoff timer cleared a hydrated nav');
     assert.equal(publishedStates.some((state) => state.notify), false, 'connected shell handoff generated a notification');
 
+    // A message can land after React disconnects the old list but before its
+    // replacement hydrates. Compare the replacement against the retained
+    // stable rows so that transition is not swallowed as a fresh baseline.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__messageGapNav = document.querySelector('#live-nav');
+      window.__messageGapNav.remove();
+    `);
+    await delay(150);
+    await win.webContents.executeJavaScript(`(() => {
+      const detached = window.__messageGapNav;
+      const row = detached.querySelector('#row-b');
+      row.setAttribute('data-unread', 'true');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Message committed during nav handoff';
+      const replacement = document.createElement('nav');
+      replacement.id = 'live-nav';
+      replacement.setAttribute('role', 'navigation');
+      replacement.setAttribute('aria-label', 'Conversation list');
+      while (detached.firstChild) replacement.appendChild(detached.firstChild);
+      document.querySelector('#main').before(replacement);
+      delete window.__messageGapNav;
+    })()`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Message committed during nav handoff'),
+      'message committed during a disconnected nav handoff was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(250);
+
+    // The source tracker may already have queued its 180 ms stable-message
+    // timer when the nav disconnects. Transfer that intent as well as row state
+    // so cleanup cannot silently eat a just-observed message.
+    win.focus();
+    win.webContents.focus();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'visible' && document.hasFocus()`,
+    ), 'test window did not focus before pending-handoff setup');
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Pending handoff baseline';
+    `);
+    await delay(250);
+    focusSink.focus();
+    focusSink.webContents.focus();
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.visibilityState === 'hidden' || !document.hasFocus()`,
+    ), 'test window did not background before pending-handoff setup');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const nav = document.querySelector('#live-nav');
+      const row = nav.querySelector('#row-b');
+      row.setAttribute('data-unread', 'true');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Pending toast across nav handoff';
+      setTimeout(() => {
+        nav.remove();
+        setTimeout(() => {
+          const replacement = document.createElement('nav');
+          replacement.id = 'live-nav';
+          replacement.setAttribute('role', 'navigation');
+          replacement.setAttribute('aria-label', 'Conversation list');
+          while (nav.firstChild) replacement.appendChild(nav.firstChild);
+          document.querySelector('#main').before(replacement);
+        }, 40);
+      }, 40);
+    })()`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Pending toast across nav handoff'),
+      'pending message toast was lost when its source nav disconnected',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(250);
+
     // A permanently absent nav must still retire after the original deadline;
     // unrelated structure reconciles cannot keep extending that deadline.
     publishedStates.length = 0;
@@ -456,8 +709,8 @@ async function run() {
       `Math.abs(document.querySelector('#live-nav').getBoundingClientRect().width - 400) <= 2`,
     ), 'dragged width did not remain stable after pointerup');
 
-    // Let the one-shot startup gate expire, then complete a skeleton row. Its
-    // first stable preview is still baseline hydration and must remain silent.
+    // Complete a startup skeleton after a long delay. Its first stable preview
+    // is still baseline hydration, without suppressing unrelated early messages.
     win.webContents.send('title-unread-hint', { available: true, count: 0 });
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(1550);
@@ -534,6 +787,47 @@ async function run() {
     await waitFor(() => publishedStates.some((state) => state.count === 0), 'read transition missing');
     assert.equal(publishedStates.findLast((state) => state.count === 0).notify, false);
 
+    // The unread marker alone is also produced by the user's "Mark as
+    // unread" action. An unchanged preview must never look like a new message.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-a').setAttribute('data-unread', 'true');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as read');
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 1), 'manual unread transition missing');
+    await delay(250);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'manual Mark as unread generated a toast');
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-a').setAttribute('data-unread', 'false');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 0), 'manual unread reset missing');
+
+    // Meta can commit the preview first and the unread marker in the following
+    // observer batch. Preserve that short-lived read-row change as a candidate.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Preview-first message'`);
+    await delay(50);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'read preview notified before unread marker');
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-a').setAttribute('data-unread', 'true');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as read');
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.body === 'Preview-first message'),
+      'preview-first/unread-second message was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-a').setAttribute('data-unread', 'false');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await waitFor(() => publishedStates.some((state) => state.count === 0), 'preview-first cleanup missing');
+
+    // The DOM message can arrive before a lagging title prefix changes from
+    // zero. The stale title must not erase the only toast/sound event.
+    win.webContents.send('title-unread-hint', { available: true, count: 0 });
+    await delay(25);
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
       document.querySelector('#row-a').setAttribute('data-unread', 'true');
@@ -541,6 +835,24 @@ async function run() {
       document.querySelector('#preview-a').textContent = 'New hello';
     `);
     await waitFor(() => publishedStates.some((state) => state.count === 1 && state.notify), 'read-to-unread notification missing');
+    assert.deepEqual(
+      publishedStates.findLast((state) => state.count === 1 && state.notify).message,
+      {
+        threadId: 'a',
+        encrypted: false,
+        title: 'Alice',
+        body: 'New hello',
+      },
+    );
+    const domFirstNotificationCount = publishedStates.filter((state) => state.notify).length;
+    win.webContents.send('title-unread-hint', { available: true, count: 1 });
+    await delay(100);
+    assert.equal(
+      publishedStates.filter((state) => state.notify).length,
+      domFirstNotificationCount,
+      'later title update duplicated a DOM message toast',
+    );
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await win.webContents.executeJavaScript(`
       window.requestAnimationFrame = window.__messengerTestRequestAnimationFrame;
       delete window.__messengerTestRequestAnimationFrame;
@@ -549,10 +861,14 @@ async function run() {
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Another hello'`);
     await waitFor(() => publishedStates.some((state) => state.count === 1 && state.notify), 'already-unread message signature change missing');
+    assert.equal(
+      publishedStates.findLast((state) => state.count === 1 && state.notify).message.body,
+      'Another hello',
+    );
 
-    // A title count increase and a different message in an already-unread DOM
-    // row can legitimately arrive inside the cross-source dedup window. The
-    // latter must not be mistaken for a duplicate of the title event.
+    // Facebook title counts are useful for the badge but carry no sender or
+    // preview. They must never create message toasts or sounds; a following
+    // DOM-confirmed message must still retain its rich metadata.
     await delay(1050);
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
@@ -560,27 +876,38 @@ async function run() {
     assert.equal(publishedStates.some((state) => state.notify), false, 'first title value after an unavailable gap notified');
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 2 });
-    await waitFor(() => publishedStates.some((state) => state.count === 2 && state.notify), 'title notification setup missing');
+    await waitFor(() => publishedStates.some((state) => state.count === 2), 'title badge update missing');
+    const titleOnlyState = publishedStates.findLast((state) => state.count === 2);
+    assert.equal(titleOnlyState.notify, false);
+    assert.equal(Object.hasOwn(titleOnlyState, 'message'), false);
+    publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
     await waitFor(
-      () => publishedStates.filter((state) => state.count === 2 && state.notify).length === 2,
-      'distinct DOM message was swallowed by cross-source dedup',
+      () => publishedStates.some((state) => state.count === 2 && state.notify && state.message),
+      'DOM-confirmed message after a title update lost its toast metadata',
+    );
+    assert.deepEqual(
+      publishedStates.findLast((state) => state.message).message,
+      {
+        threadId: 'a',
+        encrypted: false,
+        title: 'Alice',
+        body: 'Different message after title event',
+      },
     );
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
-    await waitFor(
-      () => publishedStates.some((state) => state.count === 3 && state.notify),
-      'cross-source-exempt DOM message suppressed a following title event',
-    );
+    await waitFor(() => publishedStates.some((state) => state.count === 3), 'following title badge update missing');
+    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
+    assert.equal(publishedStates.some((state) => state.message), false);
 
-    // Keep cross-source suppression no wider than the audio coalescing window.
-    // Two different messages more than 300ms apart deserve separate sounds,
-    // even when title and DOM happen to report them from opposite directions.
+    // A different thread still produces exactly one DOM-owned message toast
+    // while a title count remains available.
     await win.webContents.executeJavaScript(`
       window.__crossSourceRow = document.createElement('a');
       window.__crossSourceRow.className = 'thread';
-      window.__crossSourceRow.href = 'https://www.facebook.com/messages/t/cross-source';
-      window.__crossSourceRow.innerHTML = '<img alt=""><span dir="auto">Cross source</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button>';
+      window.__crossSourceRow.href = 'https://www.facebook.com/messages/e2ee/t/cross-source';
+      window.__crossSourceRow.innerHTML = '<img alt=""><span dir="auto">Žluťoučký chat</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button>';
       document.querySelector('#live-nav').appendChild(window.__crossSourceRow);
     `);
     await delay(350);
@@ -591,38 +918,15 @@ async function run() {
       window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct DOM-first message';
     `);
     await waitFor(
-      () => publishedStates.some((state) => state.count === 3 && state.notify),
-      'title-to-DOM dedup swallowed a message outside audio coalescing',
+      () => publishedStates.some((state) => state.count === 3 && state.notify && state.message),
+      'title badge masked a DOM-confirmed message',
     );
-    await win.webContents.executeJavaScript(`
-      window.__crossSourceRow.setAttribute('data-unread', 'false');
-      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
-    `);
-    await delay(1050);
-
-    win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    await delay(50);
-    publishedStates.length = 0;
-    await win.webContents.executeJavaScript(`
-      window.__crossSourceRow.setAttribute('data-unread', 'true');
-      window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
-      window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct title-followed message';
-    `);
-    await waitFor(
-      () => publishedStates.some((state) => state.count === 2 && state.notify),
-      'DOM notification setup for reverse cross-source order missing',
-    );
-    await delay(350);
-    win.webContents.send('title-unread-hint', { available: true, count: 4 });
-    await waitFor(
-      () => publishedStates.some((state) => state.count === 4 && state.notify),
-      'DOM-to-title dedup swallowed a message outside audio coalescing',
-    );
-    assert.equal(
-      publishedStates.filter((state) => state.notify).length,
-      2,
-      'distinct reverse-order cross-source messages did not both notify',
-    );
+    assert.deepEqual(publishedStates.findLast((state) => state.message).message, {
+      threadId: 'cross-source',
+      encrypted: true,
+      title: 'Žluťoučký chat',
+      body: 'Distinct DOM-first message',
+    });
     await win.webContents.executeJavaScript(`
       window.__crossSourceRow.setAttribute('data-unread', 'false');
       window.__crossSourceRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
@@ -633,18 +937,330 @@ async function run() {
     await delay(50);
 
     publishedStates.length = 0;
-    await win.webContents.executeJavaScript(`document.querySelector('#status-a').textContent = 'Před 2 min'`);
+    for (const timestamp of [
+      'Před 59 min',
+      'Před 1 hod',
+      'Před 1 dnem',
+      'Před 2 dny',
+      'Před týdnem',
+      'Před 2 týdny',
+      'Před měsícem',
+      'Před 2 měsíci',
+      'Právě teď',
+      'Just now',
+      'Po',
+      'Monday',
+      '20. 7.',
+      'Jul 20',
+    ]) {
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#status-a').textContent = ${JSON.stringify(timestamp)}`,
+      );
+      await delay(25);
+    }
+    await delay(250);
+    assert.equal(publishedStates.length, 0, 'relative time/date rollover generated a notification');
+
+    // Meta sometimes appends an empty accessibility/helper node after the
+    // timestamp. Its presence must not turn a time rollover into message text.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__timestampAux = document.createElement('span');
+      window.__timestampAux.setAttribute('dir', 'auto');
+      document.querySelector('#row-a').appendChild(window.__timestampAux);
+      document.querySelector('#status-a').textContent = 'Právě teď';
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`document.querySelector('#status-a').textContent = 'Před 1 min'`);
     await delay(300);
-    assert.equal(publishedStates.length, 0, 'volatile relative time generated a notification');
+    assert.equal(publishedStates.some((state) => state.notify), false, 'timestamp before a trailing helper node generated a notification');
+    await win.webContents.executeJavaScript(`window.__timestampAux.remove()`);
+
+    // A partially hydrated row may expose only its title and timestamp. A
+    // timestamp rollover is still transient even in that two-node skeleton.
+    await win.webContents.executeJavaScript(`
+      window.__calendarSkeleton = document.createElement('a');
+      window.__calendarSkeleton.className = 'thread';
+      window.__calendarSkeleton.href = 'https://www.facebook.com/messages/t/calendar-skeleton';
+      window.__calendarSkeleton.setAttribute('data-unread', 'true');
+      window.__calendarSkeleton.innerHTML = '<span dir="auto">Kalendář skeleton</span><span dir="auto">Právě teď</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').appendChild(window.__calendarSkeleton);
+    `);
+    await delay(300);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`window.__calendarSkeleton.querySelectorAll('[dir="auto"]')[1].textContent = 'Před 1 min'`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'two-node timestamp skeleton generated a notification');
+    await win.webContents.executeJavaScript(`window.__calendarSkeleton.querySelectorAll('[dir="auto"]')[1].textContent = '1 min ago'`);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__calendarSkeleton.querySelectorAll('[dir="auto"]')[1].textContent = '2 min ago'`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'English two-node timestamp skeleton generated a notification');
+    await win.webContents.executeJavaScript(`
+      window.__calendarSkeleton.setAttribute('data-unread', 'false');
+      window.__calendarSkeleton.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__calendarSkeleton.remove();
+    `);
+
+    // Conversely, a trailing calendar-looking word after an explicit sender
+    // prefix is a real body, not a status slot.
+    await win.webContents.executeJavaScript(`
+      window.__calendarBody = document.createElement('a');
+      window.__calendarBody.className = 'thread';
+      window.__calendarBody.href = 'https://www.facebook.com/messages/t/calendar-body';
+      window.__calendarBody.innerHTML = '<span dir="auto">Kalendář body</span><span dir="auto">Petr:</span><span dir="auto">Staré</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__calendarBody);
+    `);
+    await delay(300);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__calendarBody.setAttribute('data-unread', 'true');
+      window.__calendarBody.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__calendarBody.querySelectorAll('[dir="auto"]')[2].textContent = 'Ne';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'calendar-body'
+        && state.message?.body === 'Petr: · Ne'),
+      'trailing calendar-looking message body was filtered',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__calendarBody.setAttribute('data-unread', 'false');
+      window.__calendarBody.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__calendarBody.remove();
+    `);
+
+    // Once a two-node row has a stable real preview baseline, a new message is
+    // allowed to look like a calendar token. The prior content distinguishes
+    // this from a title+timestamp skeleton.
+    await win.webContents.executeJavaScript(`
+      window.__twoNodeMessage = document.createElement('a');
+      window.__twoNodeMessage.className = 'thread';
+      window.__twoNodeMessage.href = 'https://www.facebook.com/messages/t/two-node-message';
+      window.__twoNodeMessage.innerHTML = '<span dir="auto">Dvouuzlový chat</span><span dir="auto">Starý náhled</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__twoNodeMessage);
+    `);
+    await delay(300);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__twoNodeMessage.setAttribute('data-unread', 'true');
+      window.__twoNodeMessage.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__twoNodeMessage.querySelectorAll('[dir="auto"]')[1].textContent = 'Dnes';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'two-node-message'
+        && state.message?.body === 'Dnes'),
+      'calendar-looking real message in a stable two-node row was missed',
+    );
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`window.__twoNodeMessage.querySelectorAll('[dir="auto"]')[1].textContent = '12:30'`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'two-node-message'
+        && state.message?.body === '12:30'),
+      'time-looking real message in a stable two-node row was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__twoNodeMessage.setAttribute('data-unread', 'false');
+      window.__twoNodeMessage.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__twoNodeMessage.remove();
+    `);
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Alice is typing…'`);
     await delay(300);
-    assert.equal(publishedStates.length, 0, 'prefixed typing status generated a notification');
+    assert.equal(publishedStates.some((state) => state.notify), false, 'prefixed typing status generated a notification');
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'restoring the same preview after typing generated a notification');
 
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Jan píše…'`);
     await delay(300);
-    assert.equal(publishedStates.length, 0, 'localized prefixed typing status generated a notification');
+    assert.equal(publishedStates.some((state) => state.notify), false, 'localized prefixed typing status generated a notification');
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'localized typing restore generated a notification');
+
+    for (const nonMessagePreview of [
+      'Dal(a) vaší zprávě To se mi líbí',
+      'Alice reagoval(a) na vaši zprávu 👍',
+      'Alice reagovala na vaši zprávu 👍',
+      'Viděl(a) to Alice',
+      'Zmeškaný hlasový hovor',
+      'Zmeškaný videohovor',
+      'Alice pojmenoval(a) skupinu Výlet',
+      'Alice pojmenovala skupinu Výlet',
+      'Alice změnila název skupiny',
+      'Alice opustila skupinu',
+      'Alice se připojila ke skupině',
+      'Zobrazeno před 2 min',
+      'Zobrazeno právě teď',
+      'Seen 2m ago',
+      'Seen · just now',
+      'Seen 2:14 PM',
+      'Seen yesterday',
+      'Delivered 1m ago',
+      'Delivered just now',
+      'Delivered Jul 20',
+      'Zobrazeno v 14:30',
+      'Zobrazeno včera',
+      'You unsent a message',
+      'Alice unsent a message',
+      'Zrušili jste odeslání zprávy',
+      'Alice zrušila odeslání zprávy',
+      'You missed a call',
+      'Missed call',
+      'Call ended',
+      'The video call has ended',
+      'Call failed',
+      'Alice missed your video call',
+      'Hovor skončil',
+      'Videohovor se nezdařil',
+      'Alice zmeškala váš videohovor',
+      'Zprávy a hovory jsou zabezpečeny koncovým šifrováním',
+      'New: Messages and calls are secured with end-to-end encryption. Only people in this chat can read, listen to, or share them. Learn more',
+      'Nové zprávy a hovory jsou zabezpečeny koncovým šifrováním. Jen lidé v tomto chatu je můžou číst, poslouchat nebo sdílet. Další informace',
+      'Messages are missing. Restore now',
+      'Some messages are missing. Sync now',
+      'Chat history is missing. Enter your PIN to restore chat history',
+      'Historie chatu chybí. Zadejte svůj PIN pro obnovení historie chatu',
+      'Alice changed the chat theme to Ultraviolet',
+      'You changed the theme to Default',
+      'Alice set the emoji to 👍',
+      'Alice set your nickname to Bobe',
+      'Alice změnila motiv chatu na Výchozí',
+      'Alice nastavila emoji na 👍',
+      'Alice nastavila vaši přezdívku na Bobe',
+      'Alice pinned a message',
+      'Alice unpinned a message',
+      'Alice připnula zprávu',
+      'Alice odepnula zprávu',
+      'Alice turned on disappearing messages. Messages will disappear 24 hours after they’re sent',
+      'Alice zapnula automatické odstranění zpráv',
+      'Alice added Bob to the group',
+      'Alice removed Bob from the group',
+      'Alice přidala Boba do skupiny',
+      'Alice odebrala Boba ze skupiny',
+      'You are now connected on Messenger',
+      'You can now message and call each other and see info like Active Status',
+      'Say hi to your new Facebook friend',
+      'Teď jste propojeni v Messengeru',
+      'Teď si můžete posílat zprávy a volat si',
+      'Sending…',
+      "Couldn't send",
+      'This message failed to send. Click to send again',
+      'Odesílání…',
+      'Tuto zprávu se nepodařilo odeslat. Kliknutím odešlete znovu',
+    ]) {
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#preview-a').textContent = ${JSON.stringify(nonMessagePreview)}`,
+      );
+      await delay(250);
+      assert.equal(publishedStates.some((state) => state.notify), false, `${nonMessagePreview} generated a notification`);
+      await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
+      await delay(250);
+      assert.equal(publishedStates.some((state) => state.notify), false, 'restoring a preview after non-message activity generated a notification');
+    }
+
+    // Group previews can split the sender and transient activity into separate
+    // semantic leaves. Filtering the activity must not leave "Alice:" behind
+    // as an apparent message body.
+    await win.webContents.executeJavaScript(`
+      window.__splitActivityRow = document.createElement('a');
+      window.__splitActivityRow.className = 'thread';
+      window.__splitActivityRow.href = 'https://www.facebook.com/messages/t/split-activity';
+      window.__splitActivityRow.innerHTML = '<span dir="auto">Skupina</span><span dir="auto">Alice:</span><span id="split-activity-preview" dir="auto">Starý náhled</span><span dir="auto">Před 1 min</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__splitActivityRow);
+    `);
+    await delay(300);
+    for (const transientActivity of [
+      'píše…',
+      'reagovala na vaši zprávu 👍',
+      'Zobrazeno před 2 min',
+      'changed the group name',
+      'změnila fotku skupiny',
+      'added Bob to the group',
+      'odebrala Boba ze skupiny',
+      'changed the chat theme to Ultraviolet',
+      'nastavila emoji na 👍',
+      'set your nickname to Bobe',
+      'pinned a message',
+      'odepnula zprávu',
+      'turned off disappearing messages',
+      'zapnula automatické odstranění zpráv',
+      'Call ended',
+      'zmeškala váš videohovor',
+      'Messages are missing. Restore now',
+      'Odesílání…',
+    ]) {
+      publishedStates.length = 0;
+      await win.webContents.executeJavaScript(`
+        window.__splitActivityRow.setAttribute('data-unread', 'true');
+        window.__splitActivityRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+        window.__splitActivityRow.querySelectorAll('[dir="auto"]')[2].textContent = ${JSON.stringify(transientActivity)};
+      `);
+      await delay(300);
+      assert.equal(publishedStates.some((state) => state.notify), false, `${transientActivity} split activity generated a notification`);
+      await win.webContents.executeJavaScript(`
+        window.__splitActivityRow.setAttribute('data-unread', 'false');
+        window.__splitActivityRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+        window.__splitActivityRow.querySelectorAll('[dir="auto"]')[2].textContent = 'Starý náhled';
+      `);
+      await delay(250);
+    }
+
+    // The encryption notice is commonly split into independent semantic
+    // leaves. Every leaf, including the generic action link, must stay
+    // auxiliary or the final one would be mistaken for a message body.
+    for (const [intro, detailsText, learnMoreText] of [
+      [
+        'New: Messages and calls are secured with end-to-end encryption.',
+        'Only people in this chat can read, listen to, or share them.',
+        'Learn more',
+      ],
+      [
+        'Nové zprávy a hovory jsou zabezpečeny koncovým šifrováním.',
+        'Jen lidé v tomto chatu je můžou číst, poslouchat nebo sdílet.',
+        'Další informace',
+      ],
+    ]) {
+      publishedStates.length = 0;
+      await win.webContents.executeJavaScript(`(() => {
+        window.__splitActivityRow.setAttribute('data-unread', 'true');
+        window.__splitActivityRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+        const preview = window.__splitActivityRow.querySelector('#split-activity-preview');
+        preview.textContent = ${JSON.stringify(intro)};
+        const details = document.createElement('span');
+        details.id = 'e2ee-details';
+        details.setAttribute('dir', 'auto');
+        details.textContent = ${JSON.stringify(detailsText)};
+        const learnMore = document.createElement('span');
+        learnMore.id = 'e2ee-learn-more';
+        learnMore.setAttribute('dir', 'auto');
+        learnMore.textContent = ${JSON.stringify(learnMoreText)};
+        preview.after(details, learnMore);
+      })()`);
+      await delay(300);
+      assert.equal(publishedStates.some((state) => state.notify), false, `${intro} split E2EE notice generated a notification`);
+      await win.webContents.executeJavaScript(`
+        window.__splitActivityRow.setAttribute('data-unread', 'false');
+        window.__splitActivityRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+        window.__splitActivityRow.querySelector('#split-activity-preview').textContent = 'Starý náhled';
+        window.__splitActivityRow.querySelector('#e2ee-details')?.remove();
+        window.__splitActivityRow.querySelector('#e2ee-learn-more')?.remove();
+      `);
+      await delay(250);
+    }
+    await win.webContents.executeJavaScript(`window.__splitActivityRow.remove()`);
+
+    for (const outgoingPreview of ['Já: vlastní zpráva', 'Poslali jste fotku']) {
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#preview-a').textContent = ${JSON.stringify(outgoingPreview)}`,
+      );
+      await delay(300);
+      assert.equal(publishedStates.some((state) => state.notify), false, 'outgoing message preview generated a notification');
+    }
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`new Promise((resolve) => {
@@ -662,6 +1278,713 @@ async function run() {
       1,
       'one staged preview update generated multiple notifications',
     );
+
+    // Equal sender/message text must retain a body instead of degrading into
+    // sound-only behavior.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Alice'`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.body === 'Alice'),
+      'message equal to conversation title lost its toast body',
+    );
+
+    // Calendar-looking words are timestamps only in the row's trailing status
+    // slot. They remain valid message bodies in the preview slot.
+    for (const shortMessage of ['Ne', 'So', 'm', 'week']) {
+      publishedStates.length = 0;
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#preview-a').textContent = ${JSON.stringify(shortMessage)}`,
+      );
+      await waitFor(
+        () => publishedStates.some((state) => state.notify
+          && state.message?.body === shortMessage),
+        `short message ${shortMessage} was mistaken for a timestamp`,
+      );
+    }
+
+    // Reaction/control icons outside the preview are UI, even when their
+    // accessible label is an emoji.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__reactionControl = document.createElement('button');
+      window.__reactionControl.innerHTML = '<span role="img" aria-label="👍"></span>';
+      document.querySelector('#row-a').appendChild(window.__reactionControl);
+    `);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'reaction UI icon generated a message toast');
+    await win.webContents.executeJavaScript(`window.__reactionControl.remove()`);
+
+    // A reaction emoji can be nested directly inside the textual preview. The
+    // icon must not resurrect a reaction row after its text was filtered.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#preview-a').innerHTML = 'Alice reagovala na vaši zprávu <span role="img" aria-label="👍"></span>';
+    `);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'nested reaction emoji generated a message toast');
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'week'`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'restoring a preview after nested reaction generated a notification');
+
+    // Some accessibility trees expose the reaction text and emoji as sibling
+    // semantic leaves rather than nesting them in one preview wrapper.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#preview-a').textContent = 'Alice reagovala na vaši zprávu';
+      window.__siblingReactionEmoji = document.createElement('span');
+      window.__siblingReactionEmoji.setAttribute('dir', 'auto');
+      window.__siblingReactionEmoji.innerHTML = '<span role="img" aria-label="👍"></span>';
+      document.querySelector('#row-a').insertBefore(window.__siblingReactionEmoji, document.querySelector('#status-a'));
+    `);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'sibling reaction emoji generated a message toast');
+    await win.webContents.executeJavaScript(`
+      window.__siblingReactionEmoji.remove();
+      document.querySelector('#preview-a').textContent = 'week';
+    `);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'restoring a preview after sibling reaction generated a notification');
+
+    // Emoji-only previews expose their content through image accessibility
+    // labels, not textContent.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').innerHTML = '<img alt="😄">'`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.body === '😄'),
+      'emoji-only incoming message was missed',
+    );
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a img').outerHTML = '<img alt="🔥">'`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.body === '🔥'),
+      'second emoji-only incoming message was missed',
+    );
+
+    // An unrelated presence/receipt leaf elsewhere in the row must not
+    // suppress an emoji-only preview in its own semantic container.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#status-a').textContent = 'Active now';
+      document.querySelector('#preview-a img').outerHTML = '<img alt="🧡">';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.body === '🧡'),
+      'emoji-only message beside an unrelated status was missed',
+    );
+    await win.webContents.executeJavaScript(`document.querySelector('#status-a').textContent = 'Před 1 min'`);
+
+    // React/accessibility can mirror the same preview in a sibling leaf. The
+    // body and its signature both deduplicate that mirror, so adding/removing
+    // it cannot create a second toast for unchanged content.
+    await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Duplicate baseline'`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.body === 'Duplicate baseline'),
+      'duplicate-signature baseline message was missed',
+    );
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__duplicatePreview = document.createElement('span');
+      window.__duplicatePreview.setAttribute('dir', 'auto');
+      window.__duplicatePreview.textContent = 'Duplicate baseline';
+      document.querySelector('#row-a').insertBefore(window.__duplicatePreview, document.querySelector('#status-a'));
+    `);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'duplicate accessibility preview generated a notification');
+    await win.webContents.executeJavaScript(`window.__duplicatePreview.remove()`);
+    await delay(300);
+    assert.equal(publishedStates.some((state) => state.notify), false, 'removing duplicate accessibility preview generated a notification');
+
+    // If Meta removes its usual dir=auto wrappers, a confirmed changed chat
+    // preview still gets a safe generic app-authored toast.
+    await win.webContents.executeJavaScript(`
+      window.__genericRow = document.createElement('a');
+      window.__genericRow.className = 'thread';
+      window.__genericRow.href = 'https://www.facebook.com/messages/t/generic';
+      window.__genericRow.innerHTML = '<span>Old opaque preview</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__genericRow);
+    `);
+    await delay(250);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__genericRow.setAttribute('data-unread', 'true');
+      window.__genericRow.querySelector('span').textContent = 'Changed opaque preview';
+      window.__genericRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'generic'
+        && state.message?.title === 'Messenger'
+        && state.message?.body === 'Nová zpráva'),
+      'generic metadata fallback toast was missed',
+    );
+    await win.webContents.executeJavaScript(`window.__genericRow.remove()`);
+
+    // A real message can arrive as a complete React replacement instead of a
+    // text mutation. Preserve the known row baseline through the hydration
+    // quiet window and emit exactly one toast after it settles.
+    await win.webContents.executeJavaScript(`
+      window.__replacementRow = document.createElement('a');
+      window.__replacementRow.className = 'thread';
+      window.__replacementRow.href = 'https://www.facebook.com/messages/t/replacement-message';
+      window.__replacementRow.innerHTML = '<img alt=""><span dir="auto">Renata</span><span dir="auto">Old preview</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__replacementRow);
+    `);
+    await delay(250);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const messageReplacement = document.createElement('a');
+      messageReplacement.className = 'thread';
+      messageReplacement.href = 'https://www.facebook.com/messages/t/replacement-message';
+      messageReplacement.setAttribute('data-unread', 'true');
+      messageReplacement.innerHTML = '<img alt=""><span dir="auto">Renata</span><span dir="auto">Message delivered by replacement</span><button aria-label="Mark as read"></button>';
+      window.__replacementRow.replaceWith(messageReplacement);
+      window.__replacementRow = messageReplacement;
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'replacement-message'),
+      'complete React row replacement lost a real message',
+    );
+    assert.equal(
+      publishedStates.filter((state) => state.notify
+        && state.message?.threadId === 'replacement-message').length,
+      1,
+      'React row replacement emitted duplicate toasts',
+    );
+    await win.webContents.executeJavaScript(`window.__replacementRow.remove()`);
+
+    // A previously unseen row can also be old unread content inserted by lazy
+    // loading or an inbox-view switch. Without a prior content baseline it is
+    // deliberately counted but never treated as a new message.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__newTopRow = document.createElement('a');
+      window.__newTopRow.className = 'thread';
+      window.__newTopRow.href = 'https://www.facebook.com/messages/e2ee/t/new-top-message';
+      window.__newTopRow.setAttribute('data-unread', 'true');
+      window.__newTopRow.innerHTML = '<img alt=""><span dir="auto">Nový chat</span><span dir="auto">První zpráva</span><button aria-label="Mark as read"></button>';
+      window.__newTopSibling = document.createElement('a');
+      window.__newTopSibling.className = 'thread';
+      window.__newTopSibling.href = 'https://www.facebook.com/messages/t/new-top-sibling';
+      window.__newTopSibling.setAttribute('data-unread', 'true');
+      window.__newTopSibling.innerHTML = '<img alt=""><span dir="auto">Starší chat</span><span dir="auto">Hydrated preview</span><button aria-label="Mark as read"></button>';
+      const hydrationBatch = document.createDocumentFragment();
+      hydrationBatch.append(window.__newTopRow, window.__newTopSibling);
+      document.querySelector('#live-nav').insertBefore(
+        hydrationBatch,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(1100);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'new-top-message'),
+      false,
+      'unknown top-row hydration generated a notification',
+    );
+    await win.webContents.executeJavaScript(`
+      for (const row of [window.__newTopRow, window.__newTopSibling]) {
+        row.setAttribute('data-unread', 'false');
+        row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      }
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`
+      window.__newTopRow.remove();
+      window.__newTopSibling.remove();
+    `);
+
+    // A single old row can hydrate slowly too. Without a contemporaneous
+    // Messenger title-count increase, even a complete unread row at the top is
+    // only a baseline and must remain silent.
+    win.webContents.send('title-unread-hint', { available: true, count: 3 });
+    await delay(25);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__singleHydrationRow = document.createElement('a');
+      window.__singleHydrationRow.className = 'thread';
+      window.__singleHydrationRow.href = 'https://www.facebook.com/messages/t/single-hydration';
+      window.__singleHydrationRow.setAttribute('data-unread', 'true');
+      window.__singleHydrationRow.innerHTML = '<img alt=""><span dir="auto">Pomalu načtený chat</span><span dir="auto">Starý nepřečtený náhled</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__singleHydrationRow,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(2250);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'single-hydration'),
+      false,
+      'single old top-row hydration generated a notification',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__singleHydrationRow.setAttribute('data-unread', 'false');
+      window.__singleHydrationRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__singleHydrationRow.remove()`);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // In a mature background list, one complete unread row inserted at the
+    // top plus a contemporaneous title-count increase is the high-confidence
+    // first-message shape for a new conversation.
+    publishedStates.length = 0;
+    win.webContents.send('title-unread-hint', { available: true, count: 4 });
+    await delay(25);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__newMessageRow = document.createElement('a');
+      window.__newMessageRow.className = 'thread';
+      window.__newMessageRow.href = 'https://www.facebook.com/messages/e2ee/t/new-message-thread';
+      window.__newMessageRow.setAttribute('data-unread', 'true');
+      window.__newMessageRow.innerHTML = '<img alt=""><span dir="auto">Nová konverzace</span><span dir="auto">Opravdová první zpráva</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__newMessageRow,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'new-message-thread'),
+      'single new background conversation message was missed',
+    );
+    assert.deepEqual(
+      publishedStates.findLast((state) => state.message?.threadId === 'new-message-thread').message,
+      {
+        threadId: 'new-message-thread',
+        encrypted: true,
+        title: 'Nová konverzace',
+        body: 'Opravdová první zpráva',
+      },
+    );
+    await win.webContents.executeJavaScript(`
+      window.__newMessageRow.setAttribute('data-unread', 'false');
+      window.__newMessageRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__newMessageRow.remove()`);
+
+    // The renderer mutation normally wins the race against the main-process
+    // page-title roundtrip. Keep the provisional candidate alive so the later
+    // genuine 4 -> 5 title increase can corroborate it too.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__newMessageRowAfterTitle = document.createElement('a');
+      window.__newMessageRowAfterTitle.className = 'thread';
+      window.__newMessageRowAfterTitle.href = 'https://www.facebook.com/messages/t/new-message-after-title';
+      window.__newMessageRowAfterTitle.setAttribute('data-unread', 'true');
+      window.__newMessageRowAfterTitle.innerHTML = '<img alt=""><span dir="auto">Pozdější title</span><span dir="auto">DOM přišel jako první</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__newMessageRowAfterTitle,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: true, count: 5 });
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'new-message-after-title'),
+      'DOM-first new conversation was not corroborated by the later title increase',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__newMessageRowAfterTitle.setAttribute('data-unread', 'false');
+      window.__newMessageRowAfterTitle.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__newMessageRowAfterTitle.remove()`);
+
+    // One title increase is one corroboration token. If a real new row and a
+    // stale hydration appear in separate observer batches, that single signal
+    // must never promote both provisional candidates.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__tokenRowA = document.createElement('a');
+      window.__tokenRowA.className = 'thread';
+      window.__tokenRowA.href = 'https://www.facebook.com/messages/t/title-token-a';
+      window.__tokenRowA.setAttribute('data-unread', 'true');
+      window.__tokenRowA.innerHTML = '<span dir="auto">Token A</span><span dir="auto">První kandidát</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__tokenRowA,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`
+      window.__tokenRowB = document.createElement('a');
+      window.__tokenRowB.className = 'thread';
+      window.__tokenRowB.href = 'https://www.facebook.com/messages/t/title-token-b';
+      window.__tokenRowB.setAttribute('data-unread', 'true');
+      window.__tokenRowB.innerHTML = '<span dir="auto">Token B</span><span dir="auto">Druhý kandidát</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__tokenRowB,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: true, count: 6 });
+    await delay(2350);
+    assert.deepEqual(
+      publishedStates.filter((state) => state.notify
+        && ['title-token-a', 'title-token-b'].includes(state.message?.threadId))
+        .map((state) => state.message.threadId),
+      ['title-token-b'],
+      'one title increase was not reserved for the newest top-row candidate',
+    );
+    await win.webContents.executeJavaScript(`
+      for (const row of [window.__tokenRowA, window.__tokenRowB]) {
+        row.setAttribute('data-unread', 'false');
+        row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+        row.remove();
+      }
+    `);
+    await delay(100);
+
+    // A prior high title count must not suppress the next first unread after a
+    // genuinely empty inbox. DOM zero plus an unavailable title establishes
+    // the new zero baseline; a later 0 -> 1 increase can corroborate DOM-first.
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-a').setAttribute('data-unread', 'false');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__postZeroMessage = document.createElement('a');
+      window.__postZeroMessage.className = 'thread';
+      window.__postZeroMessage.href = 'https://www.facebook.com/messages/t/post-zero-message';
+      window.__postZeroMessage.setAttribute('data-unread', 'true');
+      window.__postZeroMessage.innerHTML = '<span dir="auto">Po nule</span><span dir="auto">První nová nepřečtená</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__postZeroMessage,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: true, count: 1 });
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'post-zero-message'),
+      'first new conversation after a real zero state was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__postZeroMessage.setAttribute('data-unread', 'false');
+      window.__postZeroMessage.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__postZeroMessage.remove();
+      document.querySelector('#row-a').setAttribute('data-unread', 'true');
+      document.querySelector('#read-a').setAttribute('aria-label', 'Mark as read');
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // A title increase caused by a real message in a known row belongs to that
+    // DOM event, not to some provisional stale row that happened to be waiting
+    // at the top. This prevents a duplicate known+hydration toast pair.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceHydration = document.createElement('a');
+      window.__crossSourceHydration.className = 'thread';
+      window.__crossSourceHydration.href = 'https://www.facebook.com/messages/t/cross-source-hydration';
+      window.__crossSourceHydration.setAttribute('data-unread', 'true');
+      window.__crossSourceHydration.innerHTML = '<span dir="auto">Starý lazy chat</span><span dir="auto">Starý náhled</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__crossSourceHydration,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Známý chat dostal zprávu';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Známý chat dostal zprávu'),
+      'known-row setup message was missed',
+    );
+    win.webContents.send('title-unread-hint', { available: true, count: 2 });
+    await delay(2250);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'cross-source-hydration'),
+      false,
+      'known-row title increase was reused by a stale unknown row',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__crossSourceHydration.setAttribute('data-unread', 'false');
+      window.__crossSourceHydration.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__crossSourceHydration.remove();
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // Cover the inverse renderer ordering too: title first, then the known
+    // read->unread DOM commit. The stronger known transition can revoke the
+    // stale unknown association throughout the full correlation window.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__titleFirstHydration = document.createElement('a');
+      window.__titleFirstHydration.className = 'thread';
+      window.__titleFirstHydration.href = 'https://www.facebook.com/messages/t/title-first-hydration';
+      window.__titleFirstHydration.setAttribute('data-unread', 'true');
+      window.__titleFirstHydration.innerHTML = '<span dir="auto">Title-first lazy</span><span dir="auto">Starý obsah</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__titleFirstHydration,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: true, count: 3 });
+    await delay(300);
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Title-first známá zpráva';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Title-first známá zpráva'),
+      'title-first known-row message was missed',
+    );
+    await delay(2250);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'title-first-hydration'),
+      false,
+      'title-first known-row increase was reused by a stale unknown row',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__titleFirstHydration.setAttribute('data-unread', 'false');
+      window.__titleFirstHydration.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__titleFirstHydration.remove();
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // Corroboration can arrive just before an unknown row's original two-second
+    // settle deadline. Settlement must extend from the title signal itself so
+    // a slightly later known DOM transition can still claim that generation.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__lateTitleHydration = document.createElement('a');
+      window.__lateTitleHydration.className = 'thread';
+      window.__lateTitleHydration.href = 'https://www.facebook.com/messages/t/late-title-hydration';
+      window.__lateTitleHydration.setAttribute('data-unread', 'true');
+      window.__lateTitleHydration.innerHTML = '<span dir="auto">Late-title lazy</span><span dir="auto">Starý obsah na hraně</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__lateTitleHydration,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(1750);
+    win.webContents.send('title-unread-hint', { available: true, count: 4 });
+    await delay(300);
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Známá zpráva po pozdním title';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Známá zpráva po pozdním title'),
+      'known message after late title corroboration was missed',
+    );
+    await delay(2300);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'late-title-hydration'),
+      false,
+      'late title corroboration escaped before its known DOM owner arrived',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__lateTitleHydration.setAttribute('data-unread', 'false');
+      window.__lateTitleHydration.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__lateTitleHydration.remove();
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // Separate G1/G2 generations preserve two genuine events in one burst:
+    // an unknown conversation followed by a known read->unread transition.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__burstUnknown = document.createElement('a');
+      window.__burstUnknown.className = 'thread';
+      window.__burstUnknown.href = 'https://www.facebook.com/messages/t/burst-unknown';
+      window.__burstUnknown.setAttribute('data-unread', 'true');
+      window.__burstUnknown.innerHTML = '<span dir="auto">Burst nový chat</span><span dir="auto">První burst zpráva</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').insertBefore(
+        window.__burstUnknown,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: true, count: 5 });
+    await delay(300);
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').setAttribute('data-unread', 'true');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Druhá burst zpráva';
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'b'
+        && state.message?.body === 'Druhá burst zpráva'),
+      'known half of a two-message burst was missed',
+    );
+    win.webContents.send('title-unread-hint', { available: true, count: 6 });
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'burst-unknown'),
+      'unknown half of a two-message burst was lost by later generation consumption',
+    );
+    assert.deepEqual(
+      publishedStates.filter((state) => state.notify
+        && ['b', 'burst-unknown'].includes(state.message?.threadId))
+        .map((state) => state.message.threadId)
+        .sort(),
+      ['b', 'burst-unknown'],
+    );
+    await win.webContents.executeJavaScript(`
+      window.__burstUnknown.setAttribute('data-unread', 'false');
+      window.__burstUnknown.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__burstUnknown.remove();
+      document.querySelector('#row-b').setAttribute('data-unread', 'false');
+      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    `);
+    await delay(100);
+    win.webContents.send('title-unread-hint', { available: false, count: 0 });
+    await delay(25);
+
+    // A known read conversation may be virtualized away, receive a message,
+    // and return at the top already unread. Its retained read baseline makes
+    // that transition safe to notify after the replacement settles.
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedReadRow = document.createElement('a');
+      window.__virtualizedReadRow.className = 'thread';
+      window.__virtualizedReadRow.href = 'https://www.facebook.com/messages/t/virtualized-read';
+      window.__virtualizedReadRow.innerHTML = '<img alt=""><span dir="auto">Viktorie</span><span dir="auto">Starý náhled</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__virtualizedReadRow);
+    `);
+    await delay(300);
+    await win.webContents.executeJavaScript(`window.__virtualizedReadRow.remove()`);
+    await delay(1100);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedReadRow.setAttribute('data-unread', 'true');
+      window.__virtualizedReadRow.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__virtualizedReadRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Zpráva přijatá mimo viewport';
+      document.querySelector('#live-nav').insertBefore(
+        window.__virtualizedReadRow,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'virtualized-read'
+        && state.message?.body === 'Zpráva přijatá mimo viewport'),
+      'message received while a known read row was virtualized was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedReadRow.setAttribute('data-unread', 'false');
+      window.__virtualizedReadRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__virtualizedReadRow.remove()`);
+
+    // The same offscreen path also applies when the retained conversation was
+    // already unread. It is eligible only when it returns alone at the top and
+    // its first complete preview already differs from the retained baseline.
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedUnreadRow = document.createElement('a');
+      window.__virtualizedUnreadRow.className = 'thread';
+      window.__virtualizedUnreadRow.href = 'https://www.facebook.com/messages/t/virtualized-unread';
+      window.__virtualizedUnreadRow.setAttribute('data-unread', 'true');
+      window.__virtualizedUnreadRow.innerHTML = '<img alt=""><span dir="auto">Uršula</span><span dir="auto">První nepřečtená zpráva</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').appendChild(window.__virtualizedUnreadRow);
+    `);
+    await delay(300);
+    await win.webContents.executeJavaScript(`window.__virtualizedUnreadRow.remove()`);
+    await delay(1100);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedUnreadRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Druhá zpráva mimo viewport';
+      document.querySelector('#live-nav').insertBefore(
+        window.__virtualizedUnreadRow,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'virtualized-unread'
+        && state.message?.body === 'Druhá zpráva mimo viewport'),
+      'second message received while an unread row was virtualized was missed',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedUnreadRow.setAttribute('data-unread', 'false');
+      window.__virtualizedUnreadRow.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__virtualizedUnreadRow.remove()`);
+
+    // If the same unread row first returns with its retained preview and only
+    // then hydrates different text, that change is part of the remount. The
+    // first-observed baseline keeps it silent even at the top of the list.
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedUnreadHydration = document.createElement('a');
+      window.__virtualizedUnreadHydration.className = 'thread';
+      window.__virtualizedUnreadHydration.href = 'https://www.facebook.com/messages/t/virtualized-unread-hydration';
+      window.__virtualizedUnreadHydration.setAttribute('data-unread', 'true');
+      window.__virtualizedUnreadHydration.innerHTML = '<img alt=""><span dir="auto">Hana</span><span dir="auto">Retained unread preview</span><button aria-label="Mark as read"></button>';
+      document.querySelector('#live-nav').appendChild(window.__virtualizedUnreadHydration);
+    `);
+    await delay(300);
+    await win.webContents.executeJavaScript(`window.__virtualizedUnreadHydration.remove()`);
+    await delay(1100);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`new Promise((resolve) => {
+      document.querySelector('#live-nav').insertBefore(
+        window.__virtualizedUnreadHydration,
+        document.querySelector('#live-nav a[href*="/messages/"]'),
+      );
+      setTimeout(() => {
+        window.__virtualizedUnreadHydration.querySelectorAll('[dir="auto"]')[1].textContent = 'Delayed unread hydration';
+        resolve(true);
+      }, 100);
+    })`);
+    await delay(1100);
+    assert.equal(
+      publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'virtualized-unread-hydration'),
+      false,
+      'delayed hydration of a returning unread row generated a notification',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__virtualizedUnreadHydration.setAttribute('data-unread', 'false');
+      window.__virtualizedUnreadHydration.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      window.__virtualizedUnreadHydration.remove();
+    `);
 
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
@@ -769,8 +2092,44 @@ async function run() {
     assert.equal(publishedStates.findLast((state) => state.count === 2).notify, false);
     await win.webContents.executeJavaScript(`window.__rowD.remove()`);
 
+    // A list reorder can detach and reinsert a real new-message row inside the
+    // 180 ms stability window. Suspend the candidate across that short gap.
+    await win.webContents.executeJavaScript(`
+      window.__pendingReorder = document.createElement('a');
+      window.__pendingReorder.className = 'thread';
+      window.__pendingReorder.href = 'https://www.facebook.com/messages/t/pending-reorder';
+      window.__pendingReorder.innerHTML = '<img alt=""><span dir="auto">Pending reorder</span><span dir="auto">Read</span><button aria-label="Mark as unread"></button>';
+      document.querySelector('#live-nav').appendChild(window.__pendingReorder);
+    `);
+    await delay(100);
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`new Promise((resolve) => {
+      window.__pendingReorder.setAttribute('data-unread', 'true');
+      window.__pendingReorder.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      window.__pendingReorder.querySelectorAll('[dir="auto"]')[1].textContent = 'Message survives reorder';
+      setTimeout(() => {
+        window.__pendingReorder.remove();
+        setTimeout(() => {
+          document.querySelector('#live-nav').appendChild(window.__pendingReorder);
+          resolve(true);
+        }, 40);
+      }, 40);
+    })`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify
+        && state.message?.threadId === 'pending-reorder'),
+      'real message was lost during a short row reorder',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__pendingReorder.setAttribute('data-unread', 'false');
+      window.__pendingReorder.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+    `);
+    await delay(100);
+    await win.webContents.executeJavaScript(`window.__pendingReorder.remove()`);
+
     // Removing a row while its stable-notification timer is pending must
-    // cancel the sound immediately, but retain the count until the same grace.
+    // remain silent if the row never returns, while retaining the count until
+    // the same virtualization grace expires.
     await win.webContents.executeJavaScript(`
       window.__pendingRemoval = document.createElement('a');
       window.__pendingRemoval.className = 'thread';
@@ -973,14 +2332,16 @@ async function run() {
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 2 });
     await waitFor(() => publishedStates.some((state) => state.count === 2), 'post-baseline title update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, true);
+    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, false);
+    assert.equal(publishedStates.some((state) => state.message), false);
 
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(20);
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
     await waitFor(() => publishedStates.some((state) => state.count === 3), 'brief title flap lost a real count increase');
-    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, true);
+    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
+    assert.equal(publishedStates.some((state) => state.message), false);
 
     await win.webContents.executeJavaScript(`
       document.querySelector('#live-nav')?.remove();
@@ -1048,8 +2409,9 @@ async function run() {
       8000,
     );
 
-    console.log('DOM smoke passed: layout recovery, remounts, viewport clamp, cross-source notifications, LRU boundaries, virtualization, and title fallback.');
+    console.log('DOM smoke passed: layout recovery, remounts, message-only notifications, LRU boundaries, virtualization, and title badge fallback.');
   } finally {
+    if (focusSink && !focusSink.isDestroyed()) focusSink.destroy();
     if (!win.isDestroyed()) win.destroy();
   }
 }

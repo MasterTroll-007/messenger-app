@@ -2,8 +2,10 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const packageJson = require('../package.json');
 
 const {
+  APP_USER_MODEL_ID,
   classifyNavigationUrl,
   createUsableBadgeImage,
   getTitleUnreadHint,
@@ -18,6 +20,8 @@ const {
   permitUnloadForApplicationQuit,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
+  TOAST_ACTIVATOR_CLSID,
+  validateMessageNotificationPayload,
   validateUnreadStatePayload,
 } = require('../lib/main-policy');
 
@@ -43,6 +47,9 @@ test('title parser accepts only an anchored, bounded unread prefix', () => {
 
 test('app URLs require HTTPS, an exact host, and an approved route', () => {
   assert.equal(isAllowedAppUrl('https://www.facebook.com/messages/t/123'), true);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/messenger_media/?attachment_id=123'), true);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo/?fbid=123'), true);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php?fbid=123'), true);
   assert.equal(isAllowedAppUrl('https://facebook.com/login.php?next=%2Fmessages'), true);
   assert.equal(isAllowedAppUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/profile.php?id=1'), false);
@@ -58,6 +65,12 @@ test('external URL policy allows only safe schemes and never reclassifies app UR
   assert.equal(isSafeExternalUrl('http://example.com'), false);
   assert.equal(isSafeExternalUrl('file:///C:/secret.txt'), false);
   assert.equal(classifyNavigationUrl('https://www.facebook.com/messages/'), 'internal');
+  assert.equal(
+    classifyNavigationUrl('https://www.facebook.com/messenger_media/?attachment_id=123'),
+    'internal',
+  );
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/photo/?fbid=123'), 'internal');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/photo.php?fbid=123'), 'internal');
   assert.equal(classifyNavigationUrl('https://www.facebook.com/marketplace/'), 'external');
   assert.equal(classifyNavigationUrl('https://example.com/'), 'external');
   assert.equal(classifyNavigationUrl('data:text/html,hello'), 'blocked');
@@ -69,7 +82,7 @@ test('permission policy is main-frame, route, and permission specific', () => {
     isMainFrame: true,
   };
 
-  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'notifications' }), true);
+  assert.equal(isAllowedPermissionRequest({ ...base, permission: 'notifications' }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'clipboard-sanitized-write' }), true);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'clipboard-read' }), false);
   assert.equal(isAllowedPermissionRequest({ ...base, permission: 'mediaKeySystem' }), false);
@@ -88,6 +101,11 @@ test('permission policy is main-frame, route, and permission specific', () => {
   assert.equal(isAllowedContentUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedContentUrl('https://www.messenger.com/'), true);
   assert.equal(isAllowedContentUrl('https://www.messenger.com/login/'), false);
+});
+
+test('Windows notification identity stays aligned with the NSIS app id', () => {
+  assert.equal(APP_USER_MODEL_ID, packageJson.build.appId);
+  assert.match(TOAST_ACTIVATOR_CLSID, /^\{[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}\}$/);
 });
 
 test('media type normalization permits only Electron preliminary or audio/video checks', () => {
@@ -160,22 +178,73 @@ test('unread IPC payload validation bounds count and PNG dimensions/size', () =>
   const badgeDataUrl = pngDataUrl();
   assert.deepEqual(
     validateUnreadStatePayload({ count: 4, notify: true, badgeDataUrl }),
-    { count: 4, notify: true, badgeDataUrl },
+    { count: 4, notify: false, badgeDataUrl, message: null },
   );
   assert.deepEqual(
     validateUnreadStatePayload({ count: 0, notify: true, badgeDataUrl }),
-    { count: 0, notify: false, badgeDataUrl: null },
+    { count: 0, notify: false, badgeDataUrl: null, message: null },
   );
   assert.equal(validateUnreadStatePayload({ count: -1, notify: false, badgeDataUrl: null }), null);
   assert.equal(validateUnreadStatePayload({ count: 10000, notify: false, badgeDataUrl: null }), null);
   assert.equal(validateUnreadStatePayload({ count: 1, notify: 1, badgeDataUrl: null }), null);
   assert.deepEqual(
     validateUnreadStatePayload({ count: 1, notify: true, badgeDataUrl: 'data:image/png;base64,bm90LXBuZw==' }),
-    { count: 1, notify: true, badgeDataUrl: null },
+    { count: 1, notify: false, badgeDataUrl: null, message: null },
   );
   assert.deepEqual(
     validateUnreadStatePayload({ count: 1, notify: false, badgeDataUrl: pngDataUrl(65, 16) }),
-    { count: 1, notify: false, badgeDataUrl: null },
+    { count: 1, notify: false, badgeDataUrl: null, message: null },
+  );
+});
+
+test('message notification metadata is bounded, sanitized, and independent from badge state', () => {
+  const message = {
+    threadId: ' 7566987333382615 ',
+    encrypted: true,
+    title: '  Příliš\nživý   název  ',
+    body: '  Ahoj\u0000   světe!  ',
+  };
+  const expected = {
+    threadId: '7566987333382615',
+    encrypted: true,
+    title: 'Příliš živý název',
+    body: 'Ahoj světe!',
+  };
+  assert.deepEqual(validateMessageNotificationPayload(message), expected);
+  assert.deepEqual(
+    validateMessageNotificationPayload({
+      ...message,
+      title: `Alice\u202e${'x'.repeat(130)}`,
+      body: 'Ahoj\u2066 světe\u2069',
+    }),
+    {
+      ...expected,
+      title: `Alice ${'x'.repeat(114)}`,
+      body: 'Ahoj světe',
+    },
+  );
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 2, notify: true, badgeDataUrl: null, message }),
+    { count: 2, notify: true, badgeDataUrl: null, message: expected },
+  );
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 2, notify: false, badgeDataUrl: null, message }),
+    { count: 2, notify: false, badgeDataUrl: null, message: null },
+  );
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 0, notify: true, badgeDataUrl: null, message }),
+    { count: 0, notify: true, badgeDataUrl: null, message: expected },
+  );
+  assert.equal(validateMessageNotificationPayload({ ...message, threadId: '../marketplace' }), null);
+  assert.equal(validateMessageNotificationPayload({
+    ...message,
+    threadId: 'x'.repeat(257),
+  }), null);
+  assert.equal(validateMessageNotificationPayload({ ...message, encrypted: 'true' }), null);
+  assert.equal(validateMessageNotificationPayload({ ...message, body: '   ' }), null);
+  assert.deepEqual(
+    validateUnreadStatePayload({ count: 3, notify: true, badgeDataUrl: null, message: { nope: true } }),
+    { count: 3, notify: false, badgeDataUrl: null, message: null },
   );
 });
 
