@@ -1449,6 +1449,8 @@ window.addEventListener('DOMContentLoaded', () => {
           && performance.now() - trackerStartedAt >= UNKNOWN_THREAD_BASELINE_MS
           && nav.querySelector(THREAD_LINK_SELECTOR) === link
           && (document.visibilityState === 'hidden' || !document.hasFocus());
+        const existingHiddenCache = existingState?.present !== false
+          && existingState?.structurallyLive === false;
         const allowUnknownCandidate = !existingState && singleTopBackgroundCandidate;
         const allowReturningUnreadCandidate = existingState?.present === false
           && existingState.unread === true
@@ -1456,7 +1458,7 @@ window.addEventListener('DOMContentLoaded', () => {
           && singleTopBackgroundCandidate;
         if (importedHandoff) {
           refreshIdentityHydration(link, {
-            allowCandidate: true,
+            allowCandidate: existingState?.structurallyLive === true,
             handoffCandidate: true,
             settleDelayMs: IDENTITY_REFRESH_QUIET_MS,
           });
@@ -1477,9 +1479,10 @@ window.addEventListener('DOMContentLoaded', () => {
           // sequences like identity reuse so they stay silent until settled.
           refreshIdentityHydration(link, {
             allowCandidate: Boolean(existingState)
-              ? (existingState.present !== false
+              ? (!existingHiddenCache
+                && (existingState.present !== false
                 || existingState.unread === false
-                || allowReturningUnreadCandidate)
+                || allowReturningUnreadCandidate))
               : allowUnknownCandidate,
             unknownCandidate: allowUnknownCandidate,
             settleDelayMs: allowUnknownCandidate
@@ -1632,8 +1635,10 @@ window.addEventListener('DOMContentLoaded', () => {
         visible,
       }] of measuredGroups) {
         const previous = threadState.get(id);
+        const previousWasHiddenCache = previous?.present !== false
+          && previous?.structurallyLive === false;
         const notificationEligible = notificationEligibleIds.has(id);
-        const identitySettled = identitySettledIds.delete(id);
+        const identitySettled = previousWasHiddenCache ? false : identitySettledIds.delete(id);
         const identityCandidate = identityCandidates.get(id);
         const incompleteFallback = Boolean(previous?.stable
           && fallbackOnly
@@ -1651,6 +1656,10 @@ window.addEventListener('DOMContentLoaded', () => {
           : null;
         let pendingReadUntil = pendingReadSignature ? previous.pendingReadUntil : -Infinity;
         if (previous) {
+          if (previousWasHiddenCache) {
+            cancelPendingNotification(id);
+            cancelPendingReadNotification(id);
+          }
           if (unread) cancelPendingReadNotification(id);
           if (!unread) {
             cancelPendingNotification(id);
@@ -1675,7 +1684,8 @@ window.addEventListener('DOMContentLoaded', () => {
                 && identityCandidate?.handoffCandidate
                 && identityCandidate.handoffPendingReadNotification?.signature === signature
                 && incoming;
-              if (structurallyLive
+              if (!previousWasHiddenCache
+                && structurallyLive
                 && (handoffReadTransition || transferredReadIntent)
                 && appIsBackgrounded()) {
                 const transferredIntent = identityCandidate.handoffPendingReadNotification;
@@ -1689,7 +1699,8 @@ window.addEventListener('DOMContentLoaded', () => {
                     ? transferredIntent.foregroundEpoch
                     : identityCandidate.handoffForegroundEpoch,
                 });
-              } else if (structurallyLive
+              } else if (!previousWasHiddenCache
+                && structurallyLive
                 && changedWhileRead
                 && notificationEligible
                 && incoming
@@ -1711,8 +1722,9 @@ window.addEventListener('DOMContentLoaded', () => {
             nextMessage = previous.message;
             nextSignature = previous.signature;
             stable = previous.stable;
-            pendingUnreadTransition = previous.pendingUnreadTransition === true
-              || (!previous.unread && notificationEligible);
+            pendingUnreadTransition = !previousWasHiddenCache
+              && (previous.pendingUnreadTransition === true
+                || (!previous.unread && notificationEligible));
           } else {
             const changedSignature = Boolean(signature) && previous.signature !== signature;
             const baselineHydration = previous.unread
@@ -1722,7 +1734,8 @@ window.addEventListener('DOMContentLoaded', () => {
               || previous.pendingUnreadTransition === true)
               && previous.pendingReadSignature === signature
               && previous.pendingReadUntil >= performance.now();
-            const shouldNotify = incoming
+            const shouldNotify = !previousWasHiddenCache
+              && incoming
               && structurallyLive
               && ((notificationEligible
                 && changedSignature
@@ -1733,12 +1746,14 @@ window.addEventListener('DOMContentLoaded', () => {
               && (identityCandidate.baseline
                 ? identityCandidate.baseline.signature !== signature
                 : (identityCandidate.unknownCandidate && Boolean(signature)));
-            const handoffTransitionEligible = structurallyLive
+            const handoffTransitionEligible = !previousWasHiddenCache
+              && structurallyLive
               && identityBaselineChanged
               && identityCandidate?.handoffCandidate
               && identityCandidate.baseline?.stable === true
               && incoming;
-            const identityTransitionEligible = structurallyLive
+            const identityTransitionEligible = !previousWasHiddenCache
+              && structurallyLive
               && identityBaselineChanged
               && unread
               && incoming
@@ -1751,7 +1766,8 @@ window.addEventListener('DOMContentLoaded', () => {
                 : (identityCandidate.firstObserved?.confirmed === true
                   && ownsTitleIncrease(id, identityCandidate)));
 
-            const transferredStableIntent = structurallyLive
+            const transferredStableIntent = !previousWasHiddenCache
+              && structurallyLive
               && identitySettled
               && identityCandidate?.handoffCandidate
               && identityCandidate.handoffPendingNotification?.signature === signature
@@ -1817,7 +1833,7 @@ window.addEventListener('DOMContentLoaded', () => {
           pendingReadUntil,
           retainedRouteImported,
         });
-        if (!structurallyLive) {
+        if (!structurallyLive || previousWasHiddenCache) {
           cancelPendingNotification(id);
           cancelPendingReadNotification(id);
           identityCandidates.delete(id);
@@ -2011,7 +2027,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
       for (const mutation of mutations) {
         if (mutation.type === 'attributes') {
-          const visibilityOnly = ['aria-hidden', 'class', 'hidden', 'style'].includes(mutation.attributeName);
+          const visibilityOnly = ['aria-hidden', 'class', 'hidden', 'inert', 'style'].includes(mutation.attributeName);
           collectLinks(
             mutation.target,
             visibilityOnly && mutation.target !== nav,
@@ -2052,6 +2068,7 @@ window.addEventListener('DOMContentLoaded', () => {
         'data-unread',
         'hidden',
         'href',
+        'inert',
         'style',
       ],
       childList: true,

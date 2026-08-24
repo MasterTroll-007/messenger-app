@@ -55,8 +55,10 @@ test('app URLs require HTTPS, an exact host, and an approved route', () => {
   assert.equal(isAllowedAppUrl('https://facebook.com/login.php?next=%2Fmessages'), true);
   assert.equal(isAllowedAppUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/profile.php?id=1'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php/anything?fbid=123'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.phpfoo'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php.evil'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/login.php/anything?next=%2Fmessages'), false);
   assert.equal(isAllowedAppUrl('https://evil.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('http://www.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com:444/messages/'), false);
@@ -93,8 +95,10 @@ test('only committed authentication routes clear the persisted unread state', ()
     'https://www.facebook.com/messenger_media/?attachment_id=123',
     'https://www.facebook.com/photo/?fbid=123',
     'https://www.facebook.com/photo.php?fbid=123',
+    'https://www.facebook.com/photo.php/anything?fbid=123',
     'https://www.messenger.com/',
     'https://www.messenger.com/t/123',
+    'https://www.facebook.com/login.php/anything?next=%2Fmessages',
     'https://www.facebook.com/login.phpfoo',
     'https://evil.facebook.com/login.php',
     'http://www.facebook.com/login.php',
@@ -118,6 +122,8 @@ test('external URL policy allows only safe schemes and never reclassifies app UR
   );
   assert.equal(classifyNavigationUrl('https://www.facebook.com/photo/?fbid=123'), 'internal');
   assert.equal(classifyNavigationUrl('https://www.facebook.com/photo.php?fbid=123'), 'internal');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/photo.php/anything?fbid=123'), 'external');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/login.php/anything?next=%2Fmessages'), 'external');
   assert.equal(classifyNavigationUrl('https://www.facebook.com/marketplace/'), 'external');
   assert.equal(classifyNavigationUrl('https://example.com/'), 'external');
   assert.equal(classifyNavigationUrl('data:text/html,hello'), 'blocked');
