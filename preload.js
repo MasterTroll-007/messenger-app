@@ -2290,13 +2290,9 @@ window.addEventListener('DOMContentLoaded', () => {
     source = 'structure',
     rawMessage = null,
   ) {
-    const domCount = domSnapshot?.count || 0;
-    const titleCount = latestTitleHint.available ? latestTitleHint.count : null;
-    // A title prefix can lag behind a DOM message. For a notification event,
-    // never let a stale title count of zero erase the only toast/sound signal.
-    const count = notify && source === 'dom'
-      ? Math.max(domCount, titleCount || 0)
-      : (titleCount ?? domCount);
+    // Facebook's title prefix can count general activity notifications. The
+    // native badge must represent only unread Messenger conversation rows.
+    const count = domSnapshot?.count || 0;
     const message = notify && source === 'dom' ? rawMessage : null;
     if (!notify && !message && count === lastPublishedCount) return;
     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
@@ -2310,8 +2306,8 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
   // A title prefix has no sender or preview and can include non-message
-  // Facebook activity. Use it only to improve the badge count; native toasts
-  // and their sound require a DOM-confirmed conversation-row transition.
+  // Facebook activity. Keep it only as corroboration for a newly inserted
+  // conversation row; it must never drive a badge, toast, or sound by itself.
   handleTitleHint = () => {
     if (!latestTitleHint.available
       && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {

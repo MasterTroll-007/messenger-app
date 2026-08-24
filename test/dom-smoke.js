@@ -824,8 +824,8 @@ async function run() {
     `);
     await waitFor(() => publishedStates.some((state) => state.count === 0), 'preview-first cleanup missing');
 
-    // The DOM message can arrive before a lagging title prefix changes from
-    // zero. The stale title must not erase the only toast/sound event.
+    // The DOM message can arrive while a lagging page-title hint still reports
+    // zero. That correlation-only hint must not override the message-only count.
     win.webContents.send('title-unread-hint', { available: true, count: 0 });
     await delay(25);
     publishedStates.length = 0;
@@ -866,24 +866,22 @@ async function run() {
       'Another hello',
     );
 
-    // Facebook title counts are useful for the badge but carry no sender or
-    // preview. They must never create message toasts or sounds; a following
+    // Facebook title counts can include general activity. They must never
+    // change the message-only badge or create a toast/sound; a following
     // DOM-confirmed message must still retain its rich metadata.
     await delay(1050);
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
     await delay(50);
-    assert.equal(publishedStates.some((state) => state.notify), false, 'first title value after an unavailable gap notified');
+    assert.equal(publishedStates.length, 0, 'first title-only value changed the message badge');
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 2 });
-    await waitFor(() => publishedStates.some((state) => state.count === 2), 'title badge update missing');
-    const titleOnlyState = publishedStates.findLast((state) => state.count === 2);
-    assert.equal(titleOnlyState.notify, false);
-    assert.equal(Object.hasOwn(titleOnlyState, 'message'), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'general Facebook activity changed the message badge');
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
     await waitFor(
-      () => publishedStates.some((state) => state.count === 2 && state.notify && state.message),
+      () => publishedStates.some((state) => state.count === 1 && state.notify && state.message),
       'DOM-confirmed message after a title update lost its toast metadata',
     );
     assert.deepEqual(
@@ -897,9 +895,8 @@ async function run() {
     );
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
-    await waitFor(() => publishedStates.some((state) => state.count === 3), 'following title badge update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'later Facebook activity changed the message badge');
 
     // A different thread still produces exactly one DOM-owned message toast
     // while a title count remains available.
@@ -918,8 +915,8 @@ async function run() {
       window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct DOM-first message';
     `);
     await waitFor(
-      () => publishedStates.some((state) => state.count === 3 && state.notify && state.message),
-      'title badge masked a DOM-confirmed message',
+      () => publishedStates.some((state) => state.count === 2 && state.notify && state.message),
+      'Facebook activity masked a DOM-confirmed message',
     );
     assert.deepEqual(publishedStates.findLast((state) => state.message).message, {
       threadId: 'cross-source',
@@ -1584,7 +1581,8 @@ async function run() {
     await delay(100);
     win.webContents.send('title-unread-hint', { available: true, count: 5 });
     await waitFor(
-      () => publishedStates.some((state) => state.notify
+      () => publishedStates.some((state) => state.count === 2
+        && state.notify
         && state.message?.threadId === 'new-message-after-title'),
       'DOM-first new conversation was not corroborated by the later title increase',
     );
@@ -2315,33 +2313,15 @@ async function run() {
     await delay(150);
     assert.equal(publishedStates.length, 0, 'inactive nav kept publishing mutations');
 
+    // Title-only activity, including availability flaps, must leave the zero
+    // unread-conversation state untouched.
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
-    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title fallback baseline missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    await waitFor(() => publishedStates.some((state) => state.count === 0), 'title zero transition missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 0).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: true, count: 1 });
-    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title availability recovery missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: true, count: 2 });
-    await waitFor(() => publishedStates.some((state) => state.count === 2), 'post-baseline title update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
-
-    publishedStates.length = 0;
+    await delay(20);
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(20);
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
-    await waitFor(() => publishedStates.some((state) => state.count === 3), 'brief title flap lost a real count increase');
-    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'title-only activity changed the zero message badge');
 
     await win.webContents.executeJavaScript(`
       document.querySelector('#live-nav')?.remove();
@@ -2367,9 +2347,9 @@ async function run() {
       && document.querySelectorAll('[data-messenger-app-resize-handle]').length === 1
     `), 'empty fallback nav was not discovered after its first thread link arrived');
 
-    // Keep the title source out of this tracker-only boundary test.
+    // Make the title hint unavailable before this tracker-only boundary test.
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    await waitFor(() => publishedStates.some((state) => state.count === 0), 'late nav DOM fallback missing');
+    await delay(25);
     await win.webContents.executeJavaScript(`(() => {
       const nav = document.querySelector('#late-nav');
       const fragment = document.createDocumentFragment();
@@ -2409,7 +2389,7 @@ async function run() {
       8000,
     );
 
-    console.log('DOM smoke passed: layout recovery, remounts, message-only notifications, LRU boundaries, virtualization, and title badge fallback.');
+    console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');
   } finally {
     if (focusSink && !focusSink.isDestroyed()) focusSink.destroy();
     if (!win.isDestroyed()) win.destroy();
