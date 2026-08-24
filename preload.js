@@ -1099,6 +1099,16 @@ window.addEventListener('DOMContentLoaded', () => {
       retireRetainedRouteHandoff,
     };
 
+    const lastPresentStructurallyLiveOf = (state) => (
+      state?.lastPresentStructurallyLive === true
+      || (state?.lastPresentStructurallyLive !== false && state?.structurallyLive === true)
+    );
+
+    const isHiddenCacheOriginState = (state) => Boolean(state) && (
+      (state.present !== false && state.structurallyLive === false)
+      || (state.present === false && !lastPresentStructurallyLiveOf(state))
+    );
+
     const expireKnownTitleExpectations = (now = performance.now()) => {
       for (let index = pendingKnownTitleExpectations.length - 1; index >= 0; index -= 1) {
         const expectation = pendingKnownTitleExpectations[index];
@@ -1225,6 +1235,7 @@ window.addEventListener('DOMContentLoaded', () => {
               present: true,
               visible: presentState.visible,
               structurallyLive: presentState.structurallyLive,
+              lastPresentStructurallyLive: presentState.structurallyLive,
               counted: presentState.structurallyLive,
               missingSince: null,
             });
@@ -1236,6 +1247,7 @@ window.addEventListener('DOMContentLoaded', () => {
               present: false,
               visible: false,
               structurallyLive: false,
+              lastPresentStructurallyLive: lastPresentStructurallyLiveOf(state),
               counted: false,
               missingSince: null,
             });
@@ -1434,6 +1446,7 @@ window.addEventListener('DOMContentLoaded', () => {
             || retainedRouteHandoffActive;
           existingState = {
             ...transferred,
+            lastPresentStructurallyLive: lastPresentStructurallyLiveOf(transferred),
             counted: transferred.counted !== false,
             missingSince: null,
             pendingReadSignature: null,
@@ -1449,8 +1462,7 @@ window.addEventListener('DOMContentLoaded', () => {
           && performance.now() - trackerStartedAt >= UNKNOWN_THREAD_BASELINE_MS
           && nav.querySelector(THREAD_LINK_SELECTOR) === link
           && (document.visibilityState === 'hidden' || !document.hasFocus());
-        const existingHiddenCache = existingState?.present !== false
-          && existingState?.structurallyLive === false;
+        const existingHiddenCache = isHiddenCacheOriginState(existingState);
         const allowUnknownCandidate = !existingState && singleTopBackgroundCandidate;
         const allowReturningUnreadCandidate = existingState?.present === false
           && existingState.unread === true
@@ -1547,6 +1559,7 @@ window.addEventListener('DOMContentLoaded', () => {
               present: false,
               visible: false,
               structurallyLive: false,
+              lastPresentStructurallyLive: lastPresentStructurallyLiveOf(previous),
               missingSince: performance.now(),
             });
           }
@@ -1635,8 +1648,7 @@ window.addEventListener('DOMContentLoaded', () => {
         visible,
       }] of measuredGroups) {
         const previous = threadState.get(id);
-        const previousWasHiddenCache = previous?.present !== false
-          && previous?.structurallyLive === false;
+        const previousWasHiddenCache = isHiddenCacheOriginState(previous);
         const notificationEligible = notificationEligibleIds.has(id);
         const identitySettled = previousWasHiddenCache ? false : identitySettledIds.delete(id);
         const identityCandidate = identityCandidates.get(id);
@@ -1826,6 +1838,7 @@ window.addEventListener('DOMContentLoaded', () => {
           present: true,
           visible,
           structurallyLive,
+          lastPresentStructurallyLive: structurallyLive,
           counted: structurallyLive,
           missingSince: null,
           message: nextMessage,
@@ -2638,12 +2651,6 @@ window.addEventListener('DOMContentLoaded', () => {
         acceptedSnapshot = {
           ...snapshot,
           ...verifiedSnapshot,
-        };
-      } else if (Number.isSafeInteger(snapshot.visibleCount)) {
-        acceptedSnapshot = {
-          ...snapshot,
-          count: snapshot.visibleCount,
-          presentCount: snapshot.visibleCount,
         };
       }
     }
