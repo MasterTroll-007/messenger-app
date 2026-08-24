@@ -981,6 +981,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const handoffForegroundEpoch = Number.isSafeInteger(handoffSnapshot?.foregroundEpoch)
       ? handoffSnapshot.foregroundEpoch
       : foregroundEpoch;
+    let retainedRouteHandoffActive = handoffSnapshot?.retainedRouteHandoff === true;
     const SIGNATURE_STABILITY_MS = 180;
     const IDENTITY_REFRESH_QUIET_MS = 750;
     const MISSING_COUNT_GRACE_MS = 1000;
@@ -1318,7 +1319,7 @@ window.addEventListener('DOMContentLoaded', () => {
       if (nextId) {
         let existingState = threadState.get(nextId);
         let importedHandoff = false;
-        const handoffStillValid = handoffSnapshot?.retainedRouteHandoff === true
+        const handoffStillValid = retainedRouteHandoffActive
           || performance.now()
             <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
         if (!existingState && handoffStillValid && transferredStates.has(nextId)) {
@@ -1957,6 +1958,13 @@ window.addEventListener('DOMContentLoaded', () => {
         }
       },
       cancelPendingNotificationsForForeground,
+      retireRetainedRouteHandoff() {
+        if (!retainedRouteHandoffActive) return;
+        retainedRouteHandoffActive = false;
+        transferredStates.clear();
+        transferredPendingNotifications.clear();
+        transferredPendingReadNotifications.clear();
+      },
       snapshotState() {
         const cloneState = (state) => ({
           ...state,
@@ -1981,7 +1989,7 @@ window.addEventListener('DOMContentLoaded', () => {
         });
         return {
           capturedAt: transferredStates.size > 0
-            && handoffSnapshot?.retainedRouteHandoff !== true
+            && !retainedRouteHandoffActive
             ? handoffSnapshot.capturedAt
             : performance.now(),
           foregroundEpoch: transferredStates.size > 0
@@ -2483,6 +2491,11 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     if (structureGapTimer !== null) clearStructureGap();
     clearContentVerificationGap();
+    if (pendingFreshDomVerification
+      && latestUnreadRoutePolicy?.content === true
+      && snapshotHasLiveRows(snapshot)) {
+      unreadTracker?.retireRetainedRouteHandoff?.();
+    }
     pendingFreshDomVerification = false;
     retainRouteHandoffUntilVerification = false;
     domSnapshot = snapshot;
