@@ -2492,7 +2492,6 @@ window.addEventListener('DOMContentLoaded', () => {
   let structureTimerId = null;
   let structureGapTimer = null;
   let structureGapGeneration = 0;
-  let pendingDomSnapshot = null;
   const knownConversationNavs = new WeakSet(
     document.querySelectorAll('[role="navigation"]'),
   );
@@ -2509,7 +2508,6 @@ window.addEventListener('DOMContentLoaded', () => {
     structureGapGeneration += 1;
     if (structureGapTimer !== null) clearTimeout(structureGapTimer);
     structureGapTimer = null;
-    pendingDomSnapshot = null;
   };
 
   const clearContentVerificationGap = () => {
@@ -2549,37 +2547,9 @@ window.addEventListener('DOMContentLoaded', () => {
     if (pendingFreshDomVerification || structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
     structureGapGeneration = generation;
-    pendingDomSnapshot = null;
     structureGapTimer = setTimeout(() => {
       if (generation !== structureGapGeneration) return;
       structureGapTimer = null;
-      const pending = pendingDomSnapshot;
-      pendingDomSnapshot = null;
-
-      if (activeNav && activeMain) {
-        if ((!pending || !snapshotHasLiveRows(pending))
-          && latestUnreadRoutePolicy?.content === true) {
-          clearContentVerificationGap();
-          contentVerificationExpired = false;
-          pendingFreshDomVerification = true;
-          beginContentVerificationGap();
-          return;
-        }
-        if (pending && !snapshotHasLiveRows(pending)) {
-          return;
-        }
-        if (pending) {
-          if (latestUnreadRoutePolicy?.content === true) {
-            clearContentVerificationGap();
-            pendingFreshDomVerification = false;
-          }
-          domSnapshot = { ...pending, notify: false };
-          lastVerifiedDomCount = domSnapshot.count;
-          publishCanonicalState(false, 'structure');
-        }
-        return;
-      }
-
       if (latestUnreadRoutePolicy?.content !== true) return;
       clearContentVerificationGap();
       contentVerificationExpired = false;
@@ -2589,18 +2559,22 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const acceptDomSnapshot = (snapshot, trackerControls = null) => {
-    const verifyingFreshContent = pendingFreshDomVerification
-      && latestUnreadRoutePolicy?.content === true;
-    if (verifyingFreshContent && !snapshotHasLiveRows(snapshot)) return;
-    const gapActive = structureGapTimer !== null;
-    if (gapActive && !snapshotHasLiveRows(snapshot)) {
-      pendingDomSnapshot = snapshot;
+    const onContentRoute = latestUnreadRoutePolicy?.content === true;
+    const liveSnapshot = snapshotHasLiveRows(snapshot);
+    if (onContentRoute && !liveSnapshot) {
+      if (structureGapTimer !== null) clearStructureGap();
+      if (!pendingFreshDomVerification) {
+        clearContentVerificationGap();
+        contentVerificationExpired = false;
+        pendingFreshDomVerification = true;
+        beginContentVerificationGap();
+      }
       return;
     }
     if (structureGapTimer !== null) clearStructureGap();
     clearContentVerificationGap();
     let acceptedSnapshot = snapshot;
-    if (verifyingFreshContent && snapshotHasLiveRows(snapshot)) {
+    if (pendingFreshDomVerification && onContentRoute && liveSnapshot) {
       const verifiedSnapshot = trackerControls?.finalizeFreshVerification?.();
       if (verifiedSnapshot) {
         acceptedSnapshot = {
