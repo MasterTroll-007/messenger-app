@@ -996,6 +996,7 @@ window.addEventListener('DOMContentLoaded', () => {
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
     let lastReportedRowCount = null;
+    let lastReportedVisibleRowCount = null;
     const retireRetainedRouteHandoff = () => {
       if (!retainedRouteHandoffActive) return;
       retainedRouteHandoffActive = false;
@@ -1024,6 +1025,14 @@ window.addEventListener('DOMContentLoaded', () => {
       let count = 0;
       threadState.forEach((state) => {
         if (state.present !== false) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
+    const currentVisibleRowCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.present !== false && state.visible === true) count += 1;
       });
       return Math.min(count, 9999);
     };
@@ -1077,17 +1086,21 @@ window.addEventListener('DOMContentLoaded', () => {
       const count = currentCount();
       const presentCount = currentPresentCount();
       const rowCount = currentRowCount();
+      const visibleRowCount = currentVisibleRowCount();
       if (count === lastReportedCount
         && presentCount === lastReportedPresentCount
-        && rowCount === lastReportedRowCount) return;
+        && rowCount === lastReportedRowCount
+        && visibleRowCount === lastReportedVisibleRowCount) return;
       lastReportedCount = count;
       lastReportedPresentCount = presentCount;
       lastReportedRowCount = rowCount;
+      lastReportedVisibleRowCount = visibleRowCount;
       onSnapshot({
         count,
         notify: false,
         presentCount,
         rowCount,
+        visibleRowCount,
       }, retireRetainedRouteHandoff);
     };
 
@@ -1273,6 +1286,7 @@ window.addEventListener('DOMContentLoaded', () => {
           message: current.message,
           presentCount: currentPresentCount(),
           rowCount: currentRowCount(),
+          visibleRowCount: currentVisibleRowCount(),
         }, retireRetainedRouteHandoff);
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
@@ -1441,6 +1455,7 @@ window.addEventListener('DOMContentLoaded', () => {
             threadState.set(id, {
               ...previous,
               present: false,
+              visible: false,
               missingSince: performance.now(),
             });
           }
@@ -1481,6 +1496,7 @@ window.addEventListener('DOMContentLoaded', () => {
           signature,
           substantive: substantiveState !== null,
           unread,
+          visible: visibleLinks.length > 0,
         });
 
         const identityCandidate = identityCandidates.get(id);
@@ -1517,6 +1533,7 @@ window.addEventListener('DOMContentLoaded', () => {
         signature,
         substantive,
         unread,
+        visible,
       }] of measuredGroups) {
         const previous = threadState.get(id);
         const notificationEligible = notificationEligibleIds.has(id);
@@ -1681,6 +1698,7 @@ window.addEventListener('DOMContentLoaded', () => {
           stable,
           pendingUnreadTransition,
           present: true,
+          visible,
           counted: true,
           missingSince: null,
           message: nextMessage,
@@ -2436,13 +2454,12 @@ window.addEventListener('DOMContentLoaded', () => {
       lastVerifiedDomCount = 0;
       if (!latestTitleHint.available) resetTitleBaselineForVerifiedZero();
       publishCanonicalState(false, 'structure', null, true);
-      if (activeNav?.isConnected && activeMain?.isConnected) mountUnreadTracker(activeNav);
+      reconcileStructureWithoutFeedback();
     }, CONTENT_VERIFY_GRACE_MS);
   };
 
   const snapshotHasLiveRows = (snapshot) => (
-    (Number.isSafeInteger(snapshot?.count) && snapshot.count > 0)
-    || (Number.isSafeInteger(snapshot?.rowCount) && snapshot.rowCount > 0)
+    Number.isSafeInteger(snapshot?.visibleRowCount) && snapshot.visibleRowCount > 0
   );
 
   const beginStructureGap = () => {
