@@ -29,6 +29,7 @@ const {
   isOwnedTemporaryFileName,
   normalizeRequestedMediaTypes,
   permitUnloadForApplicationQuit,
+  shouldClearUnreadStateForUrl,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   TOAST_ACTIVATOR_CLSID,
@@ -306,6 +307,12 @@ function applyNativeUnreadState() {
     }
     liveTray.setToolTip(tooltip);
   }
+}
+
+function clearNativeUnreadState() {
+  currentUnreadCount = 0;
+  currentBadgeIcon = null;
+  applyNativeUnreadState();
 }
 
 function isTrustedMainFrameIpc(event) {
@@ -642,6 +649,7 @@ function recoverUnexpectedInPageNavigation(url, isMainFrame) {
   const classification = classifyNavigationUrl(url);
   if (classification === 'internal') {
     lastAllowedAppUrl = url;
+    if (shouldClearUnreadStateForUrl(url)) clearNativeUnreadState();
     return;
   }
 
@@ -688,7 +696,10 @@ function createWindow() {
     recoverUnexpectedInPageNavigation(url, isMainFrame);
   });
   win.webContents.on('did-navigate', (_event, url) => {
-    if (isAllowedAppUrl(url)) lastAllowedAppUrl = url;
+    if (isAllowedAppUrl(url)) {
+      lastAllowedAppUrl = url;
+      if (shouldClearUnreadStateForUrl(url)) clearNativeUnreadState();
+    }
   });
   win.webContents.on('will-prevent-unload', (event) => {
     permitUnloadForApplicationQuit(event, isQuitting);

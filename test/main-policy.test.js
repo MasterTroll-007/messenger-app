@@ -18,6 +18,7 @@ const {
   normalizeRequestedMediaTypes,
   parseUnreadCountFromTitle,
   permitUnloadForApplicationQuit,
+  shouldClearUnreadStateForUrl,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   TOAST_ACTIVATOR_CLSID,
@@ -57,6 +58,47 @@ test('app URLs require HTTPS, an exact host, and an approved route', () => {
   assert.equal(isAllowedAppUrl('http://www.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com:444/messages/'), false);
   assert.equal(isAllowedAppUrl('javascript:alert(1)'), false);
+});
+
+test('only committed authentication routes clear the persisted unread state', () => {
+  const facebookAuthPaths = [
+    '/login',
+    '/login.php?next=%2Fmessages',
+    '/checkpoint/',
+    '/recover/',
+    '/two_step_verification/',
+    '/auth_platform/',
+    '/privacy/consent/',
+    '/cookie/consent/',
+    '/dialog/oauth/',
+    '/oauth/',
+  ];
+  for (const host of ['facebook.com', 'www.facebook.com', 'm.facebook.com']) {
+    for (const authPath of facebookAuthPaths) {
+      assert.equal(shouldClearUnreadStateForUrl(`https://${host}${authPath}`), true);
+    }
+  }
+  for (const host of ['messenger.com', 'www.messenger.com']) {
+    assert.equal(shouldClearUnreadStateForUrl(`https://${host}/login/?next=%2Ft%2F1`), true);
+    assert.equal(shouldClearUnreadStateForUrl(`https://${host}/checkpoint/`), true);
+  }
+
+  const retainedUrls = [
+    'https://www.facebook.com/messages/',
+    'https://www.facebook.com/messages/t/123',
+    'https://www.facebook.com/messenger_media/?attachment_id=123',
+    'https://www.facebook.com/photo/?fbid=123',
+    'https://www.facebook.com/photo.php?fbid=123',
+    'https://www.messenger.com/',
+    'https://www.messenger.com/t/123',
+    'https://evil.facebook.com/login.php',
+    'http://www.facebook.com/login.php',
+    'https://www.facebook.com:444/login.php',
+    'not a URL',
+  ];
+  for (const url of retainedUrls) {
+    assert.equal(shouldClearUnreadStateForUrl(url), false);
+  }
 });
 
 test('external URL policy allows only safe schemes and never reclassifies app URLs', () => {
