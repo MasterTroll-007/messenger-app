@@ -2462,9 +2462,8 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const effectiveVerifiedCountIsZero = () => (
-    domSnapshot
-      ? (domSnapshot.presentCount ?? domSnapshot.count) === 0
-      : lastVerifiedDomCount === 0
+    Boolean(domSnapshot)
+      && (domSnapshot.presentCount ?? domSnapshot.count) === 0
   );
 
   // A title prefix has no sender or preview and can include non-message
@@ -2538,7 +2537,7 @@ window.addEventListener('DOMContentLoaded', () => {
       unreadTracker = null;
       domSnapshot = null;
       lastVerifiedDomCount = 0;
-      if (!latestTitleHint.available) resetTitleBaselineForVerifiedZero();
+      invalidateTitleBaseline();
       publishCanonicalState(false, 'structure', null, true);
       reconcileStructureWithoutFeedback();
     }, CONTENT_VERIFY_GRACE_MS);
