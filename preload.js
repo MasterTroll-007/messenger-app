@@ -1,6 +1,7 @@
 'use strict';
 
 const { ipcRenderer } = require('electron');
+const { isAllowedContentUrl } = require('./lib/main-policy');
 
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
@@ -142,7 +143,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const MAX_NAV_WIDTH_PX = 600;
   const MAX_TRACKED_THREADS = 500;
   const STRUCTURE_GAP_GRACE_MS = 1000;
-  const CONTENT_VERIFY_GRACE_MS = STRUCTURE_GAP_GRACE_MS * 2;
+  const CONTENT_VERIFY_GRACE_MS = 15000;
   const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
   const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
   const COMPACT_CONTROL_SELECTOR = [
@@ -994,6 +995,7 @@ window.addEventListener('DOMContentLoaded', () => {
     let disposed = false;
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
+    let lastReportedUnreadPresentCount = null;
 
     const currentCount = () => {
       let count = 0;
@@ -1004,6 +1006,14 @@ window.addEventListener('DOMContentLoaded', () => {
     };
 
     const currentPresentCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.present !== false) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
+    const currentUnreadPresentCount = () => {
       let count = 0;
       threadState.forEach((state) => {
         if (state.unread && state.present !== false && state.counted !== false) count += 1;
@@ -1059,10 +1069,19 @@ window.addEventListener('DOMContentLoaded', () => {
     const publishCountIfChanged = () => {
       const count = currentCount();
       const presentCount = currentPresentCount();
-      if (count === lastReportedCount && presentCount === lastReportedPresentCount) return;
+      const unreadPresentCount = currentUnreadPresentCount();
+      if (count === lastReportedCount
+        && presentCount === lastReportedPresentCount
+        && unreadPresentCount === lastReportedUnreadPresentCount) return;
       lastReportedCount = count;
       lastReportedPresentCount = presentCount;
-      onSnapshot({ count, notify: false, presentCount });
+      lastReportedUnreadPresentCount = unreadPresentCount;
+      onSnapshot({
+        count,
+        notify: false,
+        presentCount,
+        unreadPresentCount,
+      });
     };
 
     function scheduleMissingExpiry() {
@@ -1246,6 +1265,7 @@ window.addEventListener('DOMContentLoaded', () => {
           notify: true,
           message: current.message,
           presentCount: currentPresentCount(),
+          unreadPresentCount: currentUnreadPresentCount(),
         });
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
@@ -2330,7 +2350,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // itself.
   handleTitleHint = () => {
     if (!latestTitleHint.available
-      && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
+      && (domSnapshot?.unreadPresentCount ?? domSnapshot?.count) === 0) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
     }
@@ -2393,6 +2413,11 @@ window.addEventListener('DOMContentLoaded', () => {
     }, CONTENT_VERIFY_GRACE_MS);
   };
 
+  const snapshotHasLiveRows = (snapshot) => (
+    (Number.isSafeInteger(snapshot?.count) && snapshot.count > 0)
+    || (Number.isSafeInteger(snapshot?.presentCount) && snapshot.presentCount > 0)
+  );
+
   const beginStructureGap = () => {
     if (structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
@@ -2428,9 +2453,12 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const acceptDomSnapshot = (snapshot) => {
+    if (pendingFreshDomVerification
+      && latestUnreadRoutePolicy?.content === true
+      && !snapshotHasLiveRows(snapshot)) return;
     const gapActive = structureGapTimer !== null
       && performance.now() < structureGapDeadline;
-    if (gapActive && (domSnapshot?.count || 0) > 0 && snapshot.count === 0) {
+    if (gapActive && (domSnapshot?.count || 0) > 0 && !snapshotHasLiveRows(snapshot)) {
       pendingDomSnapshot = snapshot;
       return;
     }
@@ -2439,7 +2467,7 @@ window.addEventListener('DOMContentLoaded', () => {
     pendingFreshDomVerification = false;
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
-    if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
+    if ((snapshot.unreadPresentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
     }
@@ -2761,6 +2789,13 @@ window.addEventListener('DOMContentLoaded', () => {
   window.visualViewport?.addEventListener('resize', onViewportChange, { passive: true });
   window.visualViewport?.addEventListener('scroll', onViewportChange, { passive: true });
 
+  if (!latestUnreadRoutePolicy && isAllowedContentUrl(window.location.href)) {
+    latestUnreadRoutePolicy = {
+      clear: false,
+      content: true,
+      retireRetained: false,
+    };
+  }
   handleUnreadRoutePolicy();
   if (!latestUnreadRoutePolicy) reconcileStructureWithoutFeedback();
   publishCanonicalState(false, 'structure');

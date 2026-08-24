@@ -2506,7 +2506,7 @@ async function run() {
     await waitFor(
       () => publishedStates.some((state) => state.count === 0),
       'Messages reload without a nav never retired the stale unread count',
-      8000,
+      20000,
     );
     assert.equal(
       publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
@@ -2557,27 +2557,19 @@ async function run() {
       'auth round-trip generated a message notification',
     );
 
-    // A photo/media SPA can keep its nav connected while removing its rows.
-    // Suspend the tracker so that hidden/emptied message DOM cannot overwrite
-    // the last main-owned count or generate a notification.
+    // A photo/media SPA can keep its nav connected while its rows hydrate from
+    // zero unread to unread. A live zero-unread baseline must clear retained
+    // state immediately instead of waiting for the content verification timer.
     publishedStates.length = 0;
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
       `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
     ), 'photo/media route did not suspend the unread tracker');
     await win.webContents.executeJavaScript(`
-      window.__mediaRetainedRow = document.querySelector('#reload-row');
-      window.__mediaRetainedRow.remove();
-    `);
-    await delay(1200);
-    assert.equal(
-      publishedStates.length,
-      0,
-      'photo/media DOM churn changed unread state or generated a notification',
-    );
-    await win.webContents.executeJavaScript(`
-      document.querySelector('#reload-nav').appendChild(window.__mediaRetainedRow);
-      delete window.__mediaRetainedRow;
+      const row = document.querySelector('#reload-row');
+      row.removeAttribute('data-unread');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Hydrating from a live zero-unread row';
     `);
     win.webContents.send('unread-route-policy', {
       clear: false,
@@ -2587,10 +2579,87 @@ async function run() {
     await waitFor(async () => win.webContents.executeJavaScript(
       `document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
     ), 'return from photo/media did not remount the unread tracker');
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'live zero-unread hydration never cleared the retained count',
+      8000,
+    );
     assert.equal(
-      publishedStates.some((state) => state.count === 0 || state.notify),
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'live zero-unread hydration did not become the first verified baseline',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
       false,
-      'return from photo/media changed the retained unread state',
+      'live zero-unread hydration generated a notification',
+    );
+
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'second photo/media transition did not suspend the unread tracker');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const row = document.querySelector('#reload-row');
+      row.setAttribute('data-unread', 'true');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Unread again after hydration';
+    `);
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'rehydrated unread baseline missing',
+      8000,
+    );
+
+    // An immediately recognized empty labelled nav must keep the retained
+    // count until a real conversation row appears.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'third photo/media transition did not suspend the unread tracker');
+    await win.webContents.executeJavaScript(`
+      window.__mediaRetainedRow = document.querySelector('#reload-row');
+      window.__mediaRetainedRow.remove();
+    `);
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'empty labelled nav did not remount the unread tracker');
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'empty labelled nav published before a real row appeared',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#reload-nav').appendChild(window.__mediaRetainedRow);
+      delete window.__mediaRetainedRow;
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'empty labelled nav never published after its first row appeared',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      retainedCountBeforeReload,
+      'empty labelled nav published a synthetic zero before its first row',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'empty labelled nav remount generated a notification',
     );
 
     // If Messages returns without any conversation list, start a fresh content
@@ -2598,7 +2667,7 @@ async function run() {
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
       `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
-    ), 'second photo/media transition did not suspend the unread tracker');
+    ), 'fourth photo/media transition did not suspend the unread tracker');
     await win.webContents.executeJavaScript(`document.querySelector('#reload-nav').remove()`);
     publishedStates.length = 0;
     win.webContents.send('unread-route-policy', {
@@ -2609,6 +2678,7 @@ async function run() {
     await waitFor(
       () => publishedStates.some((state) => state.count === 0),
       'Messages route without a nav never retired the retained media count',
+      20000,
     );
 
     console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');
