@@ -1981,6 +1981,7 @@ window.addEventListener('DOMContentLoaded', () => {
         });
         return {
           capturedAt: transferredStates.size > 0
+            && handoffSnapshot?.retainedRouteHandoff !== true
             ? handoffSnapshot.capturedAt
             : performance.now(),
           foregroundEpoch: transferredStates.size > 0
@@ -2641,6 +2642,7 @@ window.addEventListener('DOMContentLoaded', () => {
       suspendUnreadTracking(false);
       domSnapshot = null;
       lastVerifiedDomCount = null;
+      resetTitleBaselineForVerifiedZero();
       lastPublishedCount = 0;
       pendingFreshDomVerification = false;
       rendererUnreadRoutePhase = 'clear';
