@@ -359,6 +359,13 @@ window.addEventListener('DOMContentLoaded', () => {
       && computed.visibility !== 'collapse';
   };
 
+  const isTrackedThreadLinkVisible = (link) => {
+    const scopedNav = link?.closest?.('[data-messenger-app-nav]');
+    return isElementVisible(link, {
+      allowZeroWidth: scopedNav?.hasAttribute('data-messenger-app-nav-collapsed') === true,
+    });
+  };
+
   const threadIdentity = (link) => {
     const href = link?.getAttribute('href');
     if (!href) return null;
@@ -995,6 +1002,7 @@ window.addEventListener('DOMContentLoaded', () => {
     let disposed = false;
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
+    let lastReportedVisibleCount = null;
     let lastReportedRowCount = null;
     let lastReportedVisibleRowCount = null;
     const retireRetainedRouteHandoff = () => {
@@ -1021,6 +1029,17 @@ window.addEventListener('DOMContentLoaded', () => {
       return Math.min(count, 9999);
     };
 
+    const currentVisibleCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.unread
+          && state.present !== false
+          && state.visible === true
+          && state.counted !== false) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
     const currentRowCount = () => {
       let count = 0;
       threadState.forEach((state) => {
@@ -1035,6 +1054,43 @@ window.addEventListener('DOMContentLoaded', () => {
         if (state.present !== false && state.visible === true) count += 1;
       });
       return Math.min(count, 9999);
+    };
+
+    const syncReportedCounts = () => {
+      lastReportedCount = currentCount();
+      lastReportedPresentCount = currentPresentCount();
+      lastReportedVisibleCount = currentVisibleCount();
+      lastReportedRowCount = currentRowCount();
+      lastReportedVisibleRowCount = currentVisibleRowCount();
+      return {
+        count: lastReportedCount,
+        presentCount: lastReportedPresentCount,
+        visibleCount: lastReportedVisibleCount,
+        rowCount: lastReportedRowCount,
+        visibleRowCount: lastReportedVisibleRowCount,
+      };
+    };
+
+    const finalizeFreshVerification = () => {
+      retireRetainedRouteHandoff();
+      [...threadState.entries()].forEach(([id, state]) => {
+        if (state.present === false || state.visible === true) return;
+        cancelPendingNotification(id);
+        cancelPendingReadNotification(id);
+        touchState(id, {
+          ...state,
+          counted: false,
+          pendingReadSignature: null,
+          pendingReadUntil: -Infinity,
+          pendingUnreadTransition: false,
+        });
+      });
+      return syncReportedCounts();
+    };
+
+    const snapshotControls = {
+      finalizeFreshVerification,
+      retireRetainedRouteHandoff,
     };
 
     const expireKnownTitleExpectations = (now = performance.now()) => {
@@ -1085,23 +1141,27 @@ window.addEventListener('DOMContentLoaded', () => {
     const publishCountIfChanged = () => {
       const count = currentCount();
       const presentCount = currentPresentCount();
+      const visibleCount = currentVisibleCount();
       const rowCount = currentRowCount();
       const visibleRowCount = currentVisibleRowCount();
       if (count === lastReportedCount
         && presentCount === lastReportedPresentCount
+        && visibleCount === lastReportedVisibleCount
         && rowCount === lastReportedRowCount
         && visibleRowCount === lastReportedVisibleRowCount) return;
       lastReportedCount = count;
       lastReportedPresentCount = presentCount;
+      lastReportedVisibleCount = visibleCount;
       lastReportedRowCount = rowCount;
       lastReportedVisibleRowCount = visibleRowCount;
       onSnapshot({
         count,
         notify: false,
         presentCount,
+        visibleCount,
         rowCount,
         visibleRowCount,
-      }, retireRetainedRouteHandoff);
+      }, snapshotControls);
     };
 
     function scheduleMissingExpiry() {
@@ -1285,9 +1345,10 @@ window.addEventListener('DOMContentLoaded', () => {
           notify: true,
           message: current.message,
           presentCount: currentPresentCount(),
+          visibleCount: currentVisibleCount(),
           rowCount: currentRowCount(),
           visibleRowCount: currentVisibleRowCount(),
-        }, retireRetainedRouteHandoff);
+        }, snapshotControls);
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
       pendingNotifications.set(id, pending);
@@ -1468,7 +1529,7 @@ window.addEventListener('DOMContentLoaded', () => {
           compactNodes: compactTextNodes(link),
           link,
           unread: rowHasUnread(link),
-          visible: isElementVisible(link),
+          visible: isTrackedThreadLinkVisible(link),
         }));
         const visibleLinks = measuredLinks.filter((entry) => entry.visible);
         const links = visibleLinks.length > 0 ? visibleLinks : measuredLinks;
@@ -1983,6 +2044,7 @@ window.addEventListener('DOMContentLoaded', () => {
         }
       },
       cancelPendingNotificationsForForeground,
+      finalizeFreshVerification,
       retireRetainedRouteHandoff,
       snapshotState() {
         const cloneState = (state) => ({
@@ -2404,6 +2466,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let retainRouteHandoffUntilVerification = false;
   let contentVerificationTimer = null;
   let contentVerificationGeneration = 0;
+  let contentVerificationExpired = false;
   let pendingFreshDomVerification = false;
   let rendererUnreadRoutePhase = 'unknown';
   let structureTimerId = null;
@@ -2438,14 +2501,16 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const beginContentVerificationGap = () => {
-    if (!pendingFreshDomVerification || contentVerificationTimer !== null) return;
+    if (!pendingFreshDomVerification
+      || contentVerificationTimer !== null
+      || contentVerificationExpired) return;
     const generation = contentVerificationGeneration + 1;
     contentVerificationGeneration = generation;
     contentVerificationTimer = setTimeout(() => {
       if (generation !== contentVerificationGeneration) return;
       contentVerificationTimer = null;
       if (!pendingFreshDomVerification || latestUnreadRoutePolicy?.content !== true) return;
-      pendingFreshDomVerification = false;
+      contentVerificationExpired = true;
       retainRouteHandoffUntilVerification = false;
       pendingHandoffSnapshot = null;
       unreadTracker?.cleanup();
@@ -2497,10 +2562,10 @@ window.addEventListener('DOMContentLoaded', () => {
     }, STRUCTURE_GAP_GRACE_MS);
   };
 
-  const acceptDomSnapshot = (snapshot, retireRetainedRouteHandoff = null) => {
-    if (pendingFreshDomVerification
-      && latestUnreadRoutePolicy?.content === true
-      && !snapshotHasLiveRows(snapshot)) return;
+  const acceptDomSnapshot = (snapshot, trackerControls = null) => {
+    const verifyingFreshContent = pendingFreshDomVerification
+      && latestUnreadRoutePolicy?.content === true;
+    if (verifyingFreshContent && !snapshotHasLiveRows(snapshot)) return;
     const gapActive = structureGapTimer !== null
       && performance.now() < structureGapDeadline;
     if (gapActive && (domSnapshot?.count || 0) > 0 && !snapshotHasLiveRows(snapshot)) {
@@ -2509,22 +2574,34 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     if (structureGapTimer !== null) clearStructureGap();
     clearContentVerificationGap();
-    if (pendingFreshDomVerification
-      && latestUnreadRoutePolicy?.content === true
-      && snapshotHasLiveRows(snapshot)) {
-      retireRetainedRouteHandoff?.();
+    let acceptedSnapshot = snapshot;
+    if (verifyingFreshContent && snapshotHasLiveRows(snapshot)) {
+      const verifiedSnapshot = trackerControls?.finalizeFreshVerification?.();
+      if (verifiedSnapshot) {
+        acceptedSnapshot = {
+          ...snapshot,
+          ...verifiedSnapshot,
+        };
+      } else if (Number.isSafeInteger(snapshot.visibleCount)) {
+        acceptedSnapshot = {
+          ...snapshot,
+          count: snapshot.visibleCount,
+          presentCount: snapshot.visibleCount,
+        };
+      }
     }
     pendingFreshDomVerification = false;
+    contentVerificationExpired = false;
     retainRouteHandoffUntilVerification = false;
-    domSnapshot = snapshot;
-    lastVerifiedDomCount = snapshot.count;
-    if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
+    domSnapshot = acceptedSnapshot;
+    lastVerifiedDomCount = acceptedSnapshot.count;
+    if ((acceptedSnapshot.presentCount ?? acceptedSnapshot.count) === 0 && !latestTitleHint.available) {
       resetTitleBaselineForVerifiedZero();
     }
     publishCanonicalState(
-      snapshot.notify,
+      acceptedSnapshot.notify,
       'dom',
-      snapshot.message,
+      acceptedSnapshot.message,
     );
   };
 
@@ -2591,8 +2668,8 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const mountUnreadTracker = (nav) => {
-    unreadTracker = setupUnreadTracker(nav, (snapshot, retireRetainedRouteHandoff) => {
-      acceptDomSnapshot(snapshot, retireRetainedRouteHandoff);
+    unreadTracker = setupUnreadTracker(nav, (snapshot, trackerControls) => {
+      acceptDomSnapshot(snapshot, trackerControls);
     }, { handoffSnapshot: pendingHandoffSnapshot });
     pendingHandoffSnapshot = null;
   };
@@ -2675,6 +2752,7 @@ window.addEventListener('DOMContentLoaded', () => {
       lastVerifiedDomCount = null;
       resetTitleBaselineForVerifiedZero();
       lastPublishedCount = 0;
+      contentVerificationExpired = false;
       pendingFreshDomVerification = false;
       rendererUnreadRoutePhase = 'clear';
       return;
@@ -2685,6 +2763,7 @@ window.addEventListener('DOMContentLoaded', () => {
         unreadPublishingSuppressed = true;
         pauseUnreadTracking(true);
       }
+      contentVerificationExpired = false;
       pendingFreshDomVerification = false;
       rendererUnreadRoutePhase = 'retained';
       return;
@@ -2695,6 +2774,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const shouldRetireRetainedState = latestUnreadRoutePolicy.retireRetained === true;
     unreadPublishingSuppressed = false;
     if (enteringContent) {
+      contentVerificationExpired = false;
       pendingFreshDomVerification = previousUnreadRoutePhase === 'unknown'
         ? !domSnapshot
         : true;
