@@ -2496,8 +2496,9 @@ async function run() {
       'late-discovery reload published a synthetic zero',
     );
     publishedStates.length = 0;
+    const missingNavStartedAt = Date.now();
     await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(missingNavFixtureHtml())}`);
-    await delay(150);
+    await delay(2500);
     assert.equal(
       publishedStates.length,
       0,
@@ -2507,6 +2508,10 @@ async function run() {
       () => publishedStates.some((state) => state.count === 0),
       'Messages reload without a nav never retired the stale unread count',
       20000,
+    );
+    assert.ok(
+      Date.now() - missingNavStartedAt >= 14500,
+      'Messages reload without a nav retired stale state before the 15s verification grace',
     );
     assert.equal(
       publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
@@ -2563,21 +2568,44 @@ async function run() {
     publishedStates.length = 0;
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
-      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
     ), 'photo/media route did not suspend the unread tracker');
+    assert.deepEqual(
+      await win.webContents.executeJavaScript(`({
+        mounted: document.body.classList.contains('messenger-app-mounted'),
+        root: document.querySelector('#app')?.hasAttribute('data-messenger-app-viewport-root') === true,
+        nav: document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav') === true,
+        banner: document.querySelector('#top')?.hasAttribute('data-messenger-app-global-banner') === true,
+        resizeHandleCount: document.querySelectorAll('[data-messenger-app-resize-handle]').length,
+      })`),
+      {
+        mounted: true,
+        root: true,
+        nav: true,
+        banner: true,
+        resizeHandleCount: 1,
+      },
+      'photo/media route tore down the managed Messenger layout',
+    );
     await win.webContents.executeJavaScript(`
       const row = document.querySelector('#reload-row');
       row.removeAttribute('data-unread');
       row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
       row.querySelectorAll('[dir="auto"]')[1].textContent = 'Hydrating from a live zero-unread row';
     `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'photo/media DOM churn changed unread state while the tracker was paused',
+    );
     win.webContents.send('unread-route-policy', {
       clear: false,
       content: true,
       retireRetained: true,
     });
     await waitFor(async () => win.webContents.executeJavaScript(
-      `document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+      `Boolean(document.querySelector('#reload-row [data-messenger-app-compact-text]'))`,
     ), 'return from photo/media did not remount the unread tracker');
     await waitFor(
       () => publishedStates.some((state) => state.count === 0),
@@ -2597,7 +2625,7 @@ async function run() {
 
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
-      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
     ), 'second photo/media transition did not suspend the unread tracker');
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
@@ -2606,6 +2634,12 @@ async function run() {
       row.querySelector('button').setAttribute('aria-label', 'Mark as read');
       row.querySelectorAll('[dir="auto"]')[1].textContent = 'Unread again after hydration';
     `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'second photo/media DOM churn changed unread state while the tracker was paused',
+    );
     win.webContents.send('unread-route-policy', {
       clear: false,
       content: true,
@@ -2621,7 +2655,7 @@ async function run() {
     // count until a real conversation row appears.
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
-      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
     ), 'third photo/media transition did not suspend the unread tracker');
     await win.webContents.executeJavaScript(`
       window.__mediaRetainedRow = document.querySelector('#reload-row');
@@ -2633,10 +2667,7 @@ async function run() {
       content: true,
       retireRetained: true,
     });
-    await waitFor(async () => win.webContents.executeJavaScript(
-      `document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
-    ), 'empty labelled nav did not remount the unread tracker');
-    await delay(1200);
+    await delay(2500);
     assert.equal(
       publishedStates.length,
       0,
@@ -2666,19 +2697,30 @@ async function run() {
     // gap so the retained media count cannot survive forever.
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
-      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
     ), 'fourth photo/media transition did not suspend the unread tracker');
     await win.webContents.executeJavaScript(`document.querySelector('#reload-nav').remove()`);
     publishedStates.length = 0;
+    const missingMediaNavStartedAt = Date.now();
     win.webContents.send('unread-route-policy', {
       clear: false,
       content: true,
       retireRetained: true,
     });
+    await delay(2500);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'Messages return without a nav published before the 15s verification grace',
+    );
     await waitFor(
       () => publishedStates.some((state) => state.count === 0),
       'Messages route without a nav never retired the retained media count',
       20000,
+    );
+    assert.ok(
+      Date.now() - missingMediaNavStartedAt >= 14500,
+      'Messages return without a nav used the short structure-gap timeout',
     );
 
     console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');

@@ -1,7 +1,6 @@
 'use strict';
 
 const { ipcRenderer } = require('electron');
-const { isAllowedContentUrl } = require('./lib/main-policy');
 
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
@@ -995,7 +994,7 @@ window.addEventListener('DOMContentLoaded', () => {
     let disposed = false;
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
-    let lastReportedUnreadPresentCount = null;
+    let lastReportedRowCount = null;
 
     const currentCount = () => {
       let count = 0;
@@ -1008,15 +1007,15 @@ window.addEventListener('DOMContentLoaded', () => {
     const currentPresentCount = () => {
       let count = 0;
       threadState.forEach((state) => {
-        if (state.present !== false) count += 1;
+        if (state.unread && state.present !== false && state.counted !== false) count += 1;
       });
       return Math.min(count, 9999);
     };
 
-    const currentUnreadPresentCount = () => {
+    const currentRowCount = () => {
       let count = 0;
       threadState.forEach((state) => {
-        if (state.unread && state.present !== false && state.counted !== false) count += 1;
+        if (state.present !== false) count += 1;
       });
       return Math.min(count, 9999);
     };
@@ -1069,18 +1068,18 @@ window.addEventListener('DOMContentLoaded', () => {
     const publishCountIfChanged = () => {
       const count = currentCount();
       const presentCount = currentPresentCount();
-      const unreadPresentCount = currentUnreadPresentCount();
+      const rowCount = currentRowCount();
       if (count === lastReportedCount
         && presentCount === lastReportedPresentCount
-        && unreadPresentCount === lastReportedUnreadPresentCount) return;
+        && rowCount === lastReportedRowCount) return;
       lastReportedCount = count;
       lastReportedPresentCount = presentCount;
-      lastReportedUnreadPresentCount = unreadPresentCount;
+      lastReportedRowCount = rowCount;
       onSnapshot({
         count,
         notify: false,
         presentCount,
-        unreadPresentCount,
+        rowCount,
       });
     };
 
@@ -1265,7 +1264,7 @@ window.addEventListener('DOMContentLoaded', () => {
           notify: true,
           message: current.message,
           presentCount: currentPresentCount(),
-          unreadPresentCount: currentUnreadPresentCount(),
+          rowCount: currentRowCount(),
         });
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
@@ -2288,7 +2287,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let domSnapshot = null;
   let lastPublishedCount = null;
   let lastVerifiedDomCount = null;
-  let unreadPublishingSuppressed = false;
+  let unreadPublishingSuppressed = true;
   let lastBadgeCount = null;
   let lastBadgeDataUrl = null;
 
@@ -2350,7 +2349,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // itself.
   handleTitleHint = () => {
     if (!latestTitleHint.available
-      && (domSnapshot?.unreadPresentCount ?? domSnapshot?.count) === 0) {
+      && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
     }
@@ -2415,11 +2414,11 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const snapshotHasLiveRows = (snapshot) => (
     (Number.isSafeInteger(snapshot?.count) && snapshot.count > 0)
-    || (Number.isSafeInteger(snapshot?.presentCount) && snapshot.presentCount > 0)
+    || (Number.isSafeInteger(snapshot?.rowCount) && snapshot.rowCount > 0)
   );
 
   const beginStructureGap = () => {
-    if (structureGapTimer !== null) return;
+    if (pendingFreshDomVerification || structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
     structureGapGeneration = generation;
     structureGapDeadline = performance.now() + STRUCTURE_GAP_GRACE_MS;
@@ -2467,7 +2466,7 @@ window.addEventListener('DOMContentLoaded', () => {
     pendingFreshDomVerification = false;
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
-    if ((snapshot.unreadPresentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
+    if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
     }
@@ -2479,15 +2478,29 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const unmountNav = (publishFallback = true, retainHandoff = false) => {
-    pendingHandoffSnapshot = retainHandoff
-      ? unreadTracker?.snapshotState() || null
-      : null;
+    if (retainHandoff) {
+      pendingHandoffSnapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+    } else {
+      pendingHandoffSnapshot = null;
+    }
     unreadTracker?.cleanup();
     navControls?.cleanup();
     unreadTracker = null;
     navControls = null;
     activeNav = null;
     if (publishFallback) beginStructureGap();
+  };
+
+  const pauseUnreadTracking = (retainHandoff) => {
+    clearStructureGap();
+    clearContentVerificationGap();
+    if (retainHandoff) {
+      pendingHandoffSnapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+    } else {
+      pendingHandoffSnapshot = null;
+    }
+    unreadTracker?.cleanup();
+    unreadTracker = null;
   };
 
   const suspendUnreadTracking = (retainHandoff) => {
@@ -2514,15 +2527,19 @@ window.addEventListener('DOMContentLoaded', () => {
     }, 0);
   };
 
+  const mountUnreadTracker = (nav) => {
+    unreadTracker = setupUnreadTracker(nav, (snapshot) => {
+      acceptDomSnapshot(snapshot);
+    }, { handoffSnapshot: pendingHandoffSnapshot });
+    pendingHandoffSnapshot = null;
+  };
+
   const mountNav = (nav) => {
     activeNav = nav;
     knownConversationNavs.add(nav);
     const saved = loadState();
     navControls = setupNavControls(nav, saved, scheduleStructure);
-    unreadTracker = setupUnreadTracker(nav, (snapshot) => {
-      acceptDomSnapshot(snapshot);
-    }, { handoffSnapshot: pendingHandoffSnapshot });
-    pendingHandoffSnapshot = null;
+    mountUnreadTracker(nav);
   };
 
   function reconcileStructure() {
@@ -2563,6 +2580,8 @@ window.addEventListener('DOMContentLoaded', () => {
         unmountNav(!activeNav.isConnected || replacementNeedsGrace, retainHandoff);
       }
       mountNav(nextNav);
+    } else if (!unreadTracker) {
+      mountUnreadTracker(nextNav);
     }
     activeMain = nextMain;
     document.documentElement.classList.add('messenger-app-mounted');
@@ -2589,7 +2608,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (!latestUnreadRoutePolicy.content) {
       if (!unreadPublishingSuppressed) {
         unreadPublishingSuppressed = true;
-        suspendUnreadTracking(true);
+        pauseUnreadTracking(true);
       }
       pendingFreshDomVerification = false;
       rendererUnreadRoutePhase = 'retained';
@@ -2789,14 +2808,5 @@ window.addEventListener('DOMContentLoaded', () => {
   window.visualViewport?.addEventListener('resize', onViewportChange, { passive: true });
   window.visualViewport?.addEventListener('scroll', onViewportChange, { passive: true });
 
-  if (!latestUnreadRoutePolicy && isAllowedContentUrl(window.location.href)) {
-    latestUnreadRoutePolicy = {
-      clear: false,
-      content: true,
-      retireRetained: false,
-    };
-  }
   handleUnreadRoutePolicy();
-  if (!latestUnreadRoutePolicy) reconcileStructureWithoutFeedback();
-  publishCanonicalState(false, 'structure');
 }, { once: true });
