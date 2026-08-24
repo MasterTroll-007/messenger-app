@@ -9,6 +9,8 @@ let notificationAudioVersion = 0;
 let playScheduled = false;
 let lastAudioStart = -Infinity;
 let audioActionGeneration = 0;
+let latestUnreadRoutePolicy = null;
+let handleUnreadRoutePolicy = null;
 
 function getNotificationAudio() {
   if (!notificationAudio) {
@@ -55,6 +57,17 @@ function reloadNotificationAudio() {
 ipcRenderer.on('play-notification-sound', scheduleNotificationSound);
 ipcRenderer.on('stop-notification-sound', stopNotificationSound);
 ipcRenderer.on('notification-sound-updated', reloadNotificationAudio);
+ipcRenderer.on('unread-route-policy', (_event, rawPolicy) => {
+  const clear = rawPolicy?.clear === true;
+  latestUnreadRoutePolicy = {
+    clear,
+    content: !clear && rawPolicy?.content === true,
+    retireRetained: !clear
+      && rawPolicy?.content === true
+      && rawPolicy?.retireRetained === true,
+  };
+  handleUnreadRoutePolicy?.();
+});
 
 let latestTitleHint = { available: false, count: 0 };
 let handleTitleHint = null;
@@ -129,6 +142,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const MAX_NAV_WIDTH_PX = 600;
   const MAX_TRACKED_THREADS = 500;
   const STRUCTURE_GAP_GRACE_MS = 1000;
+  const CONTENT_VERIFY_GRACE_MS = 15000;
   const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
   const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
   const COMPACT_CONTROL_SELECTOR = [
@@ -344,6 +358,15 @@ window.addEventListener('DOMContentLoaded', () => {
       && computed.visibility !== 'hidden'
       && computed.visibility !== 'collapse';
   };
+
+  const isTrackedThreadLinkVisible = (link) => {
+    const scopedNav = link?.closest?.('[data-messenger-app-nav]');
+    return isElementVisible(link, {
+      allowZeroWidth: scopedNav?.hasAttribute('data-messenger-app-nav-collapsed') === true,
+    });
+  };
+
+  const isTrackedThreadLinkStructurallyLive = (link) => isElementStructurallyShown(link);
 
   const threadIdentity = (link) => {
     const href = link?.getAttribute('href');
@@ -967,6 +990,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const handoffForegroundEpoch = Number.isSafeInteger(handoffSnapshot?.foregroundEpoch)
       ? handoffSnapshot.foregroundEpoch
       : foregroundEpoch;
+    let retainedRouteHandoffActive = handoffSnapshot?.retainedRouteHandoff === true;
     const SIGNATURE_STABILITY_MS = 180;
     const IDENTITY_REFRESH_QUIET_MS = 750;
     const MISSING_COUNT_GRACE_MS = 1000;
@@ -980,6 +1004,16 @@ window.addEventListener('DOMContentLoaded', () => {
     let disposed = false;
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
+    let lastReportedVisibleCount = null;
+    let lastReportedRowCount = null;
+    let lastReportedVisibleRowCount = null;
+    const retireRetainedRouteHandoff = () => {
+      if (!retainedRouteHandoffActive) return;
+      retainedRouteHandoffActive = false;
+      transferredStates.clear();
+      transferredPendingNotifications.clear();
+      transferredPendingReadNotifications.clear();
+    };
 
     const currentCount = () => {
       let count = 0;
@@ -996,6 +1030,84 @@ window.addEventListener('DOMContentLoaded', () => {
       });
       return Math.min(count, 9999);
     };
+
+    const currentVisibleCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.unread
+          && state.present !== false
+          && state.visible === true
+          && state.counted !== false) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
+    const currentRowCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.present !== false) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
+    const currentVisibleRowCount = () => {
+      let count = 0;
+      threadState.forEach((state) => {
+        if (state.present !== false && state.visible === true) count += 1;
+      });
+      return Math.min(count, 9999);
+    };
+
+    const syncReportedCounts = () => {
+      lastReportedCount = currentCount();
+      lastReportedPresentCount = currentPresentCount();
+      lastReportedVisibleCount = currentVisibleCount();
+      lastReportedRowCount = currentRowCount();
+      lastReportedVisibleRowCount = currentVisibleRowCount();
+      return {
+        count: lastReportedCount,
+        presentCount: lastReportedPresentCount,
+        visibleCount: lastReportedVisibleCount,
+        rowCount: lastReportedRowCount,
+        visibleRowCount: lastReportedVisibleRowCount,
+      };
+    };
+
+    const finalizeFreshVerification = () => {
+      retireRetainedRouteHandoff();
+      [...threadState.entries()].forEach(([id, state]) => {
+        if (state.present === false
+          || state.structurallyLive === true
+          || state.retainedRouteImported !== true) return;
+        cancelPendingNotification(id);
+        cancelPendingReadNotification(id);
+        identityCandidates.delete(id);
+        identitySettledIds.delete(id);
+        touchState(id, {
+          ...state,
+          counted: false,
+          pendingReadSignature: null,
+          pendingReadUntil: -Infinity,
+          pendingUnreadTransition: false,
+        });
+      });
+      return syncReportedCounts();
+    };
+
+    const snapshotControls = {
+      finalizeFreshVerification,
+      retireRetainedRouteHandoff,
+    };
+
+    const lastPresentStructurallyLiveOf = (state) => (
+      state?.lastPresentStructurallyLive === true
+      || (state?.lastPresentStructurallyLive !== false && state?.structurallyLive === true)
+    );
+
+    const isHiddenCacheOriginState = (state) => Boolean(state) && (
+      (state.present !== false && state.structurallyLive === false)
+      || (state.present === false && !lastPresentStructurallyLiveOf(state))
+    );
 
     const expireKnownTitleExpectations = (now = performance.now()) => {
       for (let index = pendingKnownTitleExpectations.length - 1; index >= 0; index -= 1) {
@@ -1045,10 +1157,27 @@ window.addEventListener('DOMContentLoaded', () => {
     const publishCountIfChanged = () => {
       const count = currentCount();
       const presentCount = currentPresentCount();
-      if (count === lastReportedCount && presentCount === lastReportedPresentCount) return;
+      const visibleCount = currentVisibleCount();
+      const rowCount = currentRowCount();
+      const visibleRowCount = currentVisibleRowCount();
+      if (count === lastReportedCount
+        && presentCount === lastReportedPresentCount
+        && visibleCount === lastReportedVisibleCount
+        && rowCount === lastReportedRowCount
+        && visibleRowCount === lastReportedVisibleRowCount) return;
       lastReportedCount = count;
       lastReportedPresentCount = presentCount;
-      onSnapshot({ count, notify: false, presentCount });
+      lastReportedVisibleCount = visibleCount;
+      lastReportedRowCount = rowCount;
+      lastReportedVisibleRowCount = visibleRowCount;
+      onSnapshot({
+        count,
+        notify: false,
+        presentCount,
+        visibleCount,
+        rowCount,
+        visibleRowCount,
+      }, snapshotControls);
     };
 
     function scheduleMissingExpiry() {
@@ -1074,10 +1203,18 @@ window.addEventListener('DOMContentLoaded', () => {
         if (disposed) return;
 
         const expiryNow = performance.now();
-        const presentIds = new Set();
+        const presentStates = new Map();
         nav.querySelectorAll(THREAD_LINK_SELECTOR).forEach((link) => {
           const id = threadIdentity(link);
-          if (id) presentIds.add(id);
+          if (!id) return;
+          const previous = presentStates.get(id) || {
+            structurallyLive: false,
+            visible: false,
+          };
+          presentStates.set(id, {
+            structurallyLive: previous.structurallyLive || isTrackedThreadLinkStructurallyLive(link),
+            visible: previous.visible || isTrackedThreadLinkVisible(link),
+          });
         });
 
         let recoveredPresentThread = false;
@@ -1087,11 +1224,19 @@ window.addEventListener('DOMContentLoaded', () => {
             || !Number.isFinite(state.missingSince)
             || expiryNow - state.missingSince < MISSING_COUNT_GRACE_MS) return;
 
-          if (presentIds.has(id)) {
+          const presentState = presentStates.get(id);
+          if (presentState) {
+            if (!presentState.structurallyLive) {
+              cancelPendingNotification(id);
+              cancelPendingReadNotification(id);
+            }
             threadState.set(id, {
               ...state,
               present: true,
-              counted: true,
+              visible: presentState.visible,
+              structurallyLive: presentState.structurallyLive,
+              lastPresentStructurallyLive: presentState.structurallyLive,
+              counted: presentState.structurallyLive,
               missingSince: null,
             });
             markDirty(id);
@@ -1100,14 +1245,17 @@ window.addEventListener('DOMContentLoaded', () => {
             threadState.set(id, {
               ...state,
               present: false,
+              visible: false,
+              structurallyLive: false,
+              lastPresentStructurallyLive: lastPresentStructurallyLiveOf(state),
               counted: false,
               missingSince: null,
             });
           }
         });
 
-        // Update the DOM snapshot even when an available title hint currently
-        // masks it; a later title-format change must not revive stale unread.
+        // Publish the DOM-owned count even while a title hint is available so
+        // later title churn cannot revive stale unread rows.
         publishCountIfChanged();
         if (recoveredPresentThread) scheduleFlush();
         scheduleMissingExpiry();
@@ -1232,7 +1380,10 @@ window.addEventListener('DOMContentLoaded', () => {
           notify: true,
           message: current.message,
           presentCount: currentPresentCount(),
-        });
+          visibleCount: currentVisibleCount(),
+          rowCount: currentRowCount(),
+          visibleRowCount: currentVisibleRowCount(),
+        }, snapshotControls);
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
       pendingNotifications.set(id, pending);
@@ -1285,18 +1436,23 @@ window.addEventListener('DOMContentLoaded', () => {
       if (nextId) {
         let existingState = threadState.get(nextId);
         let importedHandoff = false;
-        const handoffStillValid = performance.now()
-          <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
+        const handoffStillValid = retainedRouteHandoffActive
+          || performance.now()
+            <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
         if (!existingState && handoffStillValid && transferredStates.has(nextId)) {
           const transferred = transferredStates.get(nextId);
           transferredStates.delete(nextId);
+          const retainedRouteImported = transferred.retainedRouteImported === true
+            || retainedRouteHandoffActive;
           existingState = {
             ...transferred,
-            counted: true,
+            lastPresentStructurallyLive: lastPresentStructurallyLiveOf(transferred),
+            counted: transferred.counted !== false,
             missingSince: null,
             pendingReadSignature: null,
             pendingReadUntil: -Infinity,
             present: true,
+            retainedRouteImported,
           };
           touchState(nextId, existingState);
           importedHandoff = true;
@@ -1306,6 +1462,7 @@ window.addEventListener('DOMContentLoaded', () => {
           && performance.now() - trackerStartedAt >= UNKNOWN_THREAD_BASELINE_MS
           && nav.querySelector(THREAD_LINK_SELECTOR) === link
           && (document.visibilityState === 'hidden' || !document.hasFocus());
+        const existingHiddenCache = isHiddenCacheOriginState(existingState);
         const allowUnknownCandidate = !existingState && singleTopBackgroundCandidate;
         const allowReturningUnreadCandidate = existingState?.present === false
           && existingState.unread === true
@@ -1313,7 +1470,7 @@ window.addEventListener('DOMContentLoaded', () => {
           && singleTopBackgroundCandidate;
         if (importedHandoff) {
           refreshIdentityHydration(link, {
-            allowCandidate: true,
+            allowCandidate: existingState?.structurallyLive === true,
             handoffCandidate: true,
             settleDelayMs: IDENTITY_REFRESH_QUIET_MS,
           });
@@ -1334,9 +1491,10 @@ window.addEventListener('DOMContentLoaded', () => {
           // sequences like identity reuse so they stay silent until settled.
           refreshIdentityHydration(link, {
             allowCandidate: Boolean(existingState)
-              ? (existingState.present !== false
+              ? (!existingHiddenCache
+                && (existingState.present !== false
                 || existingState.unread === false
-                || allowReturningUnreadCandidate)
+                || allowReturningUnreadCandidate))
               : allowUnknownCandidate,
             unknownCandidate: allowUnknownCandidate,
             settleDelayMs: allowUnknownCandidate
@@ -1399,6 +1557,9 @@ window.addEventListener('DOMContentLoaded', () => {
             threadState.set(id, {
               ...previous,
               present: false,
+              visible: false,
+              structurallyLive: false,
+              lastPresentStructurallyLive: lastPresentStructurallyLiveOf(previous),
               missingSince: performance.now(),
             });
           }
@@ -1410,11 +1571,17 @@ window.addEventListener('DOMContentLoaded', () => {
         const measuredLinks = allLinks.map((link) => ({
           compactNodes: compactTextNodes(link),
           link,
+          structurallyLive: isTrackedThreadLinkStructurallyLive(link),
           unread: rowHasUnread(link),
-          visible: isElementVisible(link),
+          visible: isTrackedThreadLinkVisible(link),
         }));
         const visibleLinks = measuredLinks.filter((entry) => entry.visible);
-        const links = visibleLinks.length > 0 ? visibleLinks : measuredLinks;
+        const structurallyLiveLinks = measuredLinks.filter((entry) => entry.structurallyLive);
+        const links = visibleLinks.length > 0
+          ? visibleLinks
+          : structurallyLiveLinks.length > 0
+            ? structurallyLiveLinks
+            : measuredLinks;
         const unreadLinks = links.filter((entry) => entry.unread).map((entry) => entry.link);
         const unread = unreadLinks.length > 0;
         const contentLinks = unread
@@ -1439,6 +1606,8 @@ window.addEventListener('DOMContentLoaded', () => {
           signature,
           substantive: substantiveState !== null,
           unread,
+          structurallyLive: structurallyLiveLinks.length > 0,
+          visible: visibleLinks.length > 0,
         });
 
         const identityCandidate = identityCandidates.get(id);
@@ -1474,11 +1643,14 @@ window.addEventListener('DOMContentLoaded', () => {
         message,
         signature,
         substantive,
+        structurallyLive,
         unread,
+        visible,
       }] of measuredGroups) {
         const previous = threadState.get(id);
+        const previousWasHiddenCache = isHiddenCacheOriginState(previous);
         const notificationEligible = notificationEligibleIds.has(id);
-        const identitySettled = identitySettledIds.delete(id);
+        const identitySettled = previousWasHiddenCache ? false : identitySettledIds.delete(id);
         const identityCandidate = identityCandidates.get(id);
         const incompleteFallback = Boolean(previous?.stable
           && fallbackOnly
@@ -1496,6 +1668,10 @@ window.addEventListener('DOMContentLoaded', () => {
           : null;
         let pendingReadUntil = pendingReadSignature ? previous.pendingReadUntil : -Infinity;
         if (previous) {
+          if (previousWasHiddenCache) {
+            cancelPendingNotification(id);
+            cancelPendingReadNotification(id);
+          }
           if (unread) cancelPendingReadNotification(id);
           if (!unread) {
             cancelPendingNotification(id);
@@ -1520,7 +1696,10 @@ window.addEventListener('DOMContentLoaded', () => {
                 && identityCandidate?.handoffCandidate
                 && identityCandidate.handoffPendingReadNotification?.signature === signature
                 && incoming;
-              if ((handoffReadTransition || transferredReadIntent) && appIsBackgrounded()) {
+              if (!previousWasHiddenCache
+                && structurallyLive
+                && (handoffReadTransition || transferredReadIntent)
+                && appIsBackgrounded()) {
                 const transferredIntent = identityCandidate.handoffPendingReadNotification;
                 pendingReadSignature = signature;
                 pendingReadUntil = performance.now() + READ_MARKER_LAG_MS;
@@ -1532,7 +1711,9 @@ window.addEventListener('DOMContentLoaded', () => {
                     ? transferredIntent.foregroundEpoch
                     : identityCandidate.handoffForegroundEpoch,
                 });
-              } else if (changedWhileRead
+              } else if (!previousWasHiddenCache
+                && structurallyLive
+                && changedWhileRead
                 && notificationEligible
                 && incoming
                 && appIsBackgrounded()) {
@@ -1553,8 +1734,9 @@ window.addEventListener('DOMContentLoaded', () => {
             nextMessage = previous.message;
             nextSignature = previous.signature;
             stable = previous.stable;
-            pendingUnreadTransition = previous.pendingUnreadTransition === true
-              || (!previous.unread && notificationEligible);
+            pendingUnreadTransition = !previousWasHiddenCache
+              && (previous.pendingUnreadTransition === true
+                || (!previous.unread && notificationEligible));
           } else {
             const changedSignature = Boolean(signature) && previous.signature !== signature;
             const baselineHydration = previous.unread
@@ -1564,7 +1746,9 @@ window.addEventListener('DOMContentLoaded', () => {
               || previous.pendingUnreadTransition === true)
               && previous.pendingReadSignature === signature
               && previous.pendingReadUntil >= performance.now();
-            const shouldNotify = incoming
+            const shouldNotify = !previousWasHiddenCache
+              && incoming
+              && structurallyLive
               && ((notificationEligible
                 && changedSignature
                 && !baselineHydration)
@@ -1574,11 +1758,15 @@ window.addEventListener('DOMContentLoaded', () => {
               && (identityCandidate.baseline
                 ? identityCandidate.baseline.signature !== signature
                 : (identityCandidate.unknownCandidate && Boolean(signature)));
-            const handoffTransitionEligible = identityBaselineChanged
+            const handoffTransitionEligible = !previousWasHiddenCache
+              && structurallyLive
+              && identityBaselineChanged
               && identityCandidate?.handoffCandidate
               && identityCandidate.baseline?.stable === true
               && incoming;
-            const identityTransitionEligible = identityBaselineChanged
+            const identityTransitionEligible = !previousWasHiddenCache
+              && structurallyLive
+              && identityBaselineChanged
               && unread
               && incoming
               && (identityCandidate.baseline
@@ -1590,7 +1778,9 @@ window.addEventListener('DOMContentLoaded', () => {
                 : (identityCandidate.firstObserved?.confirmed === true
                   && ownsTitleIncrease(id, identityCandidate)));
 
-            const transferredStableIntent = identitySettled
+            const transferredStableIntent = !previousWasHiddenCache
+              && structurallyLive
+              && identitySettled
               && identityCandidate?.handoffCandidate
               && identityCandidate.handoffPendingNotification?.signature === signature
               && unread
@@ -1632,6 +1822,13 @@ window.addEventListener('DOMContentLoaded', () => {
             pendingReadUntil = -Infinity;
           }
         }
+        const retainedRouteImported = previous?.retainedRouteImported === true
+          && structurallyLive !== true;
+        if (!structurallyLive) {
+          pendingUnreadTransition = false;
+          pendingReadSignature = null;
+          pendingReadUntil = -Infinity;
+        }
         touchState(id, {
           incoming: nextIncoming,
           unread,
@@ -1639,12 +1836,22 @@ window.addEventListener('DOMContentLoaded', () => {
           stable,
           pendingUnreadTransition,
           present: true,
-          counted: true,
+          visible,
+          structurallyLive,
+          lastPresentStructurallyLive: structurallyLive,
+          counted: structurallyLive,
           missingSince: null,
           message: nextMessage,
           pendingReadSignature,
           pendingReadUntil,
+          retainedRouteImported,
         });
+        if (!structurallyLive || previousWasHiddenCache) {
+          cancelPendingNotification(id);
+          cancelPendingReadNotification(id);
+          identityCandidates.delete(id);
+          identitySettledIds.delete(id);
+        }
         if (identitySettled) identityCandidates.delete(id);
       }
       trimState();
@@ -1833,7 +2040,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
       for (const mutation of mutations) {
         if (mutation.type === 'attributes') {
-          const visibilityOnly = ['aria-hidden', 'class', 'hidden', 'style'].includes(mutation.attributeName);
+          const visibilityOnly = ['aria-hidden', 'class', 'hidden', 'inert', 'style'].includes(mutation.attributeName);
           collectLinks(
             mutation.target,
             visibilityOnly && mutation.target !== nav,
@@ -1874,6 +2081,7 @@ window.addEventListener('DOMContentLoaded', () => {
         'data-unread',
         'hidden',
         'href',
+        'inert',
         'style',
       ],
       childList: true,
@@ -1923,6 +2131,8 @@ window.addEventListener('DOMContentLoaded', () => {
         }
       },
       cancelPendingNotificationsForForeground,
+      finalizeFreshVerification,
+      retireRetainedRouteHandoff,
       snapshotState() {
         const cloneState = (state) => ({
           ...state,
@@ -1947,6 +2157,7 @@ window.addEventListener('DOMContentLoaded', () => {
         });
         return {
           capturedAt: transferredStates.size > 0
+            && !retainedRouteHandoffActive
             ? handoffSnapshot.capturedAt
             : performance.now(),
           foregroundEpoch: transferredStates.size > 0
@@ -2253,6 +2464,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
   let domSnapshot = null;
   let lastPublishedCount = null;
+  let lastVerifiedDomCount = null;
+  let unreadPublishingSuppressed = true;
   let lastBadgeCount = null;
   let lastBadgeDataUrl = null;
 
@@ -2289,16 +2502,16 @@ window.addEventListener('DOMContentLoaded', () => {
     notify = false,
     source = 'structure',
     rawMessage = null,
+    forcePublish = false,
   ) {
-    const domCount = domSnapshot?.count || 0;
-    const titleCount = latestTitleHint.available ? latestTitleHint.count : null;
-    // A title prefix can lag behind a DOM message. For a notification event,
-    // never let a stale title count of zero erase the only toast/sound signal.
-    const count = notify && source === 'dom'
-      ? Math.max(domCount, titleCount || 0)
-      : (titleCount ?? domCount);
+    if (unreadPublishingSuppressed) return;
+    // Facebook's title prefix can count general activity notifications. The
+    // tray, taskbar, title, and badge counts must come only from unread
+    // Messenger conversation rows.
+    const count = domSnapshot ? domSnapshot.count : lastVerifiedDomCount;
+    if (!Number.isSafeInteger(count) || count < 0) return;
     const message = notify && source === 'dom' ? rawMessage : null;
-    if (!notify && !message && count === lastPublishedCount) return;
+    if (!forcePublish && !notify && !message && count === lastPublishedCount) return;
     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
     ipcRenderer.send('publish-unread-state', {
       count,
@@ -2309,14 +2522,28 @@ window.addEventListener('DOMContentLoaded', () => {
     lastPublishedCount = count;
   }
 
+  const resetTitleBaselineForVerifiedZero = () => {
+    lastObservedTitleCount = 0;
+    retireTitleIncreasesThrough(latestTitleIncrease.generation);
+  };
+
+  const invalidateTitleBaseline = () => {
+    lastObservedTitleCount = null;
+    retireTitleIncreasesThrough(latestTitleIncrease.generation);
+  };
+
+  const effectiveVerifiedCountIsZero = () => (
+    Boolean(domSnapshot)
+      && (domSnapshot.presentCount ?? domSnapshot.count) === 0
+  );
+
   // A title prefix has no sender or preview and can include non-message
-  // Facebook activity. Use it only to improve the badge count; native toasts
-  // and their sound require a DOM-confirmed conversation-row transition.
+  // Facebook activity. Keep it only as corroboration for a newly inserted
+  // conversation row; it must never drive a count surface, toast, or sound by
+  // itself.
   handleTitleHint = () => {
-    if (!latestTitleHint.available
-      && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
-      lastObservedTitleCount = 0;
-      retireTitleIncreasesThrough(latestTitleIncrease.generation);
+    if (!latestTitleHint.available && effectiveVerifiedCountIsZero()) {
+      resetTitleBaselineForVerifiedZero();
     }
     unreadTracker?.noteTitleHint();
     publishCanonicalState(false, 'title');
@@ -2327,11 +2554,15 @@ window.addEventListener('DOMContentLoaded', () => {
   let unreadTracker = null;
   let navControls = null;
   let pendingHandoffSnapshot = null;
+  let retainRouteHandoffUntilVerification = false;
+  let contentVerificationTimer = null;
+  let contentVerificationGeneration = 0;
+  let contentVerificationExpired = false;
+  let pendingFreshDomVerification = false;
+  let rendererUnreadRoutePhase = 'unknown';
   let structureTimerId = null;
   let structureGapTimer = null;
-  let structureGapDeadline = -Infinity;
   let structureGapGeneration = 0;
-  let pendingDomSnapshot = null;
   const knownConversationNavs = new WeakSet(
     document.querySelectorAll('[role="navigation"]'),
   );
@@ -2348,67 +2579,148 @@ window.addEventListener('DOMContentLoaded', () => {
     structureGapGeneration += 1;
     if (structureGapTimer !== null) clearTimeout(structureGapTimer);
     structureGapTimer = null;
-    structureGapDeadline = -Infinity;
-    pendingDomSnapshot = null;
   };
 
+  const clearContentVerificationGap = () => {
+    contentVerificationGeneration += 1;
+    if (contentVerificationTimer !== null) clearTimeout(contentVerificationTimer);
+    contentVerificationTimer = null;
+  };
+
+  const beginContentVerificationGap = () => {
+    if (!pendingFreshDomVerification
+      || contentVerificationTimer !== null
+      || contentVerificationExpired) return;
+    const generation = contentVerificationGeneration + 1;
+    contentVerificationGeneration = generation;
+    contentVerificationTimer = setTimeout(() => {
+      if (generation !== contentVerificationGeneration) return;
+      contentVerificationTimer = null;
+      if (!pendingFreshDomVerification || latestUnreadRoutePolicy?.content !== true) return;
+      contentVerificationExpired = true;
+      retainRouteHandoffUntilVerification = false;
+      pendingHandoffSnapshot = null;
+      unreadTracker?.cleanup();
+      unreadTracker = null;
+      domSnapshot = null;
+      lastVerifiedDomCount = 0;
+      invalidateTitleBaseline();
+      publishCanonicalState(false, 'structure', null, true);
+      reconcileStructureWithoutFeedback();
+    }, CONTENT_VERIFY_GRACE_MS);
+  };
+
+  const snapshotHasLiveRows = (snapshot) => (
+    Number.isSafeInteger(snapshot?.visibleRowCount) && snapshot.visibleRowCount > 0
+  );
+
   const beginStructureGap = () => {
-    if (structureGapTimer !== null) return;
+    if (pendingFreshDomVerification || structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
     structureGapGeneration = generation;
-    structureGapDeadline = performance.now() + STRUCTURE_GAP_GRACE_MS;
-    pendingDomSnapshot = null;
     structureGapTimer = setTimeout(() => {
       if (generation !== structureGapGeneration) return;
       structureGapTimer = null;
-      structureGapDeadline = -Infinity;
-      const pending = pendingDomSnapshot;
-      pendingDomSnapshot = null;
-
-      if (activeNav && activeMain) {
-        if (pending) {
-          domSnapshot = { ...pending, notify: false };
-          publishCanonicalState(false, 'structure');
-        }
-        return;
-      }
-
-      domSnapshot = null;
-      pendingHandoffSnapshot = null;
-      publishCanonicalState(false, 'structure');
+      if (latestUnreadRoutePolicy?.content !== true) return;
+      clearContentVerificationGap();
+      contentVerificationExpired = false;
+      pendingFreshDomVerification = true;
+      beginContentVerificationGap();
     }, STRUCTURE_GAP_GRACE_MS);
   };
 
-  const acceptDomSnapshot = (snapshot) => {
-    const gapActive = structureGapTimer !== null
-      && performance.now() < structureGapDeadline;
-    if (gapActive && (domSnapshot?.count || 0) > 0 && snapshot.count === 0) {
-      pendingDomSnapshot = snapshot;
+  const acceptDomSnapshot = (snapshot, trackerControls = null) => {
+    const onContentRoute = latestUnreadRoutePolicy?.content === true;
+    const liveSnapshot = snapshotHasLiveRows(snapshot);
+    if (onContentRoute && !liveSnapshot) {
+      if (structureGapTimer !== null) clearStructureGap();
+      if (!pendingFreshDomVerification) {
+        clearContentVerificationGap();
+        contentVerificationExpired = false;
+        pendingFreshDomVerification = true;
+        beginContentVerificationGap();
+      }
       return;
     }
     if (structureGapTimer !== null) clearStructureGap();
-    domSnapshot = snapshot;
-    if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
-      lastObservedTitleCount = 0;
-      retireTitleIncreasesThrough(latestTitleIncrease.generation);
+    clearContentVerificationGap();
+    let acceptedSnapshot = snapshot;
+    if (pendingFreshDomVerification && onContentRoute && liveSnapshot) {
+      const verifiedSnapshot = trackerControls?.finalizeFreshVerification?.();
+      if (verifiedSnapshot) {
+        acceptedSnapshot = {
+          ...snapshot,
+          ...verifiedSnapshot,
+        };
+      }
+    }
+    pendingFreshDomVerification = false;
+    contentVerificationExpired = false;
+    retainRouteHandoffUntilVerification = false;
+    domSnapshot = acceptedSnapshot;
+    lastVerifiedDomCount = acceptedSnapshot.count;
+    if ((acceptedSnapshot.presentCount ?? acceptedSnapshot.count) === 0 && !latestTitleHint.available) {
+      resetTitleBaselineForVerifiedZero();
     }
     publishCanonicalState(
-      snapshot.notify,
+      acceptedSnapshot.notify,
       'dom',
-      snapshot.message,
+      acceptedSnapshot.message,
     );
   };
 
   const unmountNav = (publishFallback = true, retainHandoff = false) => {
-    pendingHandoffSnapshot = retainHandoff
-      ? unreadTracker?.snapshotState() || null
-      : null;
+    if (retainHandoff) {
+      const snapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      pendingHandoffSnapshot = snapshot
+        ? retainRouteHandoffUntilVerification
+          ? { ...snapshot, retainedRouteHandoff: true }
+          : snapshot
+        : null;
+    } else {
+      pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
+    }
     unreadTracker?.cleanup();
     navControls?.cleanup();
     unreadTracker = null;
     navControls = null;
     activeNav = null;
     if (publishFallback) beginStructureGap();
+  };
+
+  const pauseUnreadTracking = (retainHandoff) => {
+    clearStructureGap();
+    clearContentVerificationGap();
+    if (retainHandoff) {
+      const snapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      retainRouteHandoffUntilVerification = true;
+      pendingHandoffSnapshot = snapshot ? { ...snapshot, retainedRouteHandoff: true } : null;
+    } else {
+      pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
+    }
+    unreadTracker?.cleanup();
+    unreadTracker = null;
+  };
+
+  const suspendUnreadTracking = (retainHandoff) => {
+    clearStructureGap();
+    clearContentVerificationGap();
+    if (activeNav) unmountNav(false, retainHandoff);
+    else if (!retainHandoff) {
+      pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
+    }
+    activeMain = null;
+    clearManagedLayout();
+    document.documentElement.classList.remove('messenger-app-mounted');
+    document.body.classList.remove(
+      'messenger-app-mounted',
+      'messenger-app-compact',
+      'messenger-app-menu-hidden',
+    );
+    clearPageConstraints();
   };
 
   const scheduleStructure = () => {
@@ -2419,54 +2731,60 @@ window.addEventListener('DOMContentLoaded', () => {
     }, 0);
   };
 
+  const mountUnreadTracker = (nav) => {
+    unreadTracker = setupUnreadTracker(nav, (snapshot, trackerControls) => {
+      acceptDomSnapshot(snapshot, trackerControls);
+    }, { handoffSnapshot: pendingHandoffSnapshot });
+    pendingHandoffSnapshot = null;
+  };
+
   const mountNav = (nav) => {
     activeNav = nav;
     knownConversationNavs.add(nav);
     const saved = loadState();
     navControls = setupNavControls(nav, saved, scheduleStructure);
-    unreadTracker = setupUnreadTracker(nav, (snapshot) => {
-      acceptDomSnapshot(snapshot);
-    }, { handoffSnapshot: pendingHandoffSnapshot });
-    pendingHandoffSnapshot = null;
+    mountUnreadTracker(nav);
   };
 
   function reconcileStructure() {
-    let nextNav = findVisibleConversationList();
-    if (!nextNav && isElementStructurallyShown(activeNav)) nextNav = activeNav;
-    let nextMain = nextNav ? findVisibleMain(nextNav) : null;
-    if (!nextMain && nextNav === activeNav && isElementStructurallyShown(activeMain)) {
-      nextMain = activeMain;
+    if (unreadPublishingSuppressed) {
+      if (rendererUnreadRoutePhase === 'retained'
+        && activeNav?.isConnected
+        && activeMain?.isConnected) {
+        document.documentElement.classList.add('messenger-app-mounted');
+        document.body.classList.add('messenger-app-mounted');
+        applyPageConstraints();
+        applyManagedLayout(activeNav, activeMain);
+        navControls?.refresh();
+      }
+      return;
     }
+    let nextNav = findVisibleConversationList();
+    let nextMain = nextNav ? findVisibleMain(nextNav) : null;
 
     if (!nextNav || !nextMain) {
-      const preserveConnectedTracker = Boolean(activeNav?.isConnected);
-      if (activeNav && !preserveConnectedTracker) unmountNav(true, true);
-      if (!activeNav || !activeMain?.isConnected) activeMain = null;
+      if (activeNav) unmountNav(true, true);
+      else beginStructureGap();
+      activeMain = null;
       clearManagedLayout();
       document.documentElement.classList.remove('messenger-app-mounted');
-      document.body.classList.remove('messenger-app-mounted');
-      if (!preserveConnectedTracker) {
-        document.body.classList.remove(
-          'messenger-app-compact',
-          'messenger-app-menu-hidden',
-        );
-      }
+      document.body.classList.remove(
+        'messenger-app-mounted',
+        'messenger-app-compact',
+        'messenger-app-menu-hidden',
+      );
       clearPageConstraints();
       return;
     }
 
     if (activeNav !== nextNav) {
       if (activeNav) {
-        // A replacement can already contain thread anchors while React is
-        // still hydrating their unread semantics. Any zero snapshot during a
-        // handoff from a nonzero list therefore needs the same fixed grace as
-        // a completely empty skeleton.
-        const replacementNeedsGrace = (domSnapshot?.count || 0) > 0;
-        const isNewReplacement = !knownConversationNavs.has(nextNav);
-        const retainHandoff = !activeNav.isConnected || isNewReplacement;
-        unmountNav(!activeNav.isConnected || replacementNeedsGrace, retainHandoff);
+        const retainHandoff = !activeNav.isConnected || !knownConversationNavs.has(nextNav);
+        unmountNav(true, retainHandoff);
       }
       mountNav(nextNav);
+    } else if (!unreadTracker) {
+      mountUnreadTracker(nextNav);
     }
     activeMain = nextMain;
     document.documentElement.classList.add('messenger-app-mounted');
@@ -2475,6 +2793,50 @@ window.addEventListener('DOMContentLoaded', () => {
     applyManagedLayout(nextNav, nextMain);
     navControls?.refresh();
   }
+
+  handleUnreadRoutePolicy = () => {
+    if (!latestUnreadRoutePolicy) return;
+
+    if (latestUnreadRoutePolicy.clear) {
+      unreadPublishingSuppressed = true;
+      suspendUnreadTracking(false);
+      domSnapshot = null;
+      lastVerifiedDomCount = null;
+      invalidateTitleBaseline();
+      lastPublishedCount = 0;
+      contentVerificationExpired = false;
+      pendingFreshDomVerification = false;
+      rendererUnreadRoutePhase = 'clear';
+      return;
+    }
+
+    if (!latestUnreadRoutePolicy.content) {
+      if (!unreadPublishingSuppressed) {
+        unreadPublishingSuppressed = true;
+        pauseUnreadTracking(true);
+      }
+      lastPublishedCount = null;
+      contentVerificationExpired = false;
+      pendingFreshDomVerification = false;
+      rendererUnreadRoutePhase = 'retained';
+      return;
+    }
+
+    const previousUnreadRoutePhase = rendererUnreadRoutePhase;
+    const enteringContent = previousUnreadRoutePhase !== 'content';
+    const shouldRetireRetainedState = latestUnreadRoutePolicy.retireRetained === true;
+    unreadPublishingSuppressed = false;
+    if (enteringContent) {
+      contentVerificationExpired = false;
+      pendingFreshDomVerification = previousUnreadRoutePhase === 'unknown'
+        ? !domSnapshot
+        : true;
+    }
+    rendererUnreadRoutePhase = 'content';
+    reconcileStructureWithoutFeedback();
+    if (shouldRetireRetainedState && (!activeNav || !activeMain)) beginStructureGap();
+    if (pendingFreshDomVerification) beginContentVerificationGap();
+  };
 
   const isDirectStructuralCandidate = (node) => {
     if (node?.nodeType !== Node.ELEMENT_NODE) return false;
@@ -2654,6 +3016,5 @@ window.addEventListener('DOMContentLoaded', () => {
   window.visualViewport?.addEventListener('resize', onViewportChange, { passive: true });
   window.visualViewport?.addEventListener('scroll', onViewportChange, { passive: true });
 
-  reconcileStructureWithoutFeedback();
-  publishCanonicalState(false, 'structure');
+  handleUnreadRoutePolicy();
 }, { once: true });

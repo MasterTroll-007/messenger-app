@@ -24,11 +24,13 @@ const {
   createUsableBadgeImage,
   getTitleUnreadHint,
   isAllowedAppUrl,
+  isAllowedContentUrl,
   isAllowedPermissionRequest,
   isExpectedNavigationAbort,
   isOwnedTemporaryFileName,
   normalizeRequestedMediaTypes,
   permitUnloadForApplicationQuit,
+  shouldClearUnreadStateForUrl,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   TOAST_ACTIVATOR_CLSID,
@@ -79,6 +81,7 @@ let isMuted = false;
 let customSoundFile = null;
 let currentUnreadCount = 0;
 let currentBadgeIcon = null;
+let unreadRoutePhase = 'unknown';
 let lastAllowedAppUrl = MESSENGER_URL;
 let settingsOperationQueue = Promise.resolve();
 let settingsFlushPromise = null;
@@ -308,6 +311,28 @@ function applyNativeUnreadState() {
   }
 }
 
+function clearNativeUnreadState() {
+  currentUnreadCount = 0;
+  currentBadgeIcon = null;
+  applyNativeUnreadState();
+}
+
+function applyUnreadRoutePolicy(url) {
+  const win = getLiveMainWindow();
+  if (!win) return;
+
+  const clear = shouldClearUnreadStateForUrl(url);
+  const content = isAllowedContentUrl(url);
+  const retireRetained = content && unreadRoutePhase === 'retained';
+  if (clear) clearNativeUnreadState();
+  unreadRoutePhase = clear ? 'clear' : content ? 'content' : 'retained';
+  sendToMainWindow('unread-route-policy', {
+    clear,
+    content,
+    retireRetained,
+  });
+}
+
 function isTrustedMainFrameIpc(event) {
   const win = getLiveMainWindow();
   if (!win || event.sender !== win.webContents || event.sender.isDestroyed()) return false;
@@ -318,7 +343,7 @@ function isTrustedMainFrameIpc(event) {
 
   const isSameFrame = senderFrame === mainFrame
     || (senderFrame.processId === mainFrame.processId && senderFrame.routingId === mainFrame.routingId);
-  return isSameFrame && isAllowedAppUrl(senderFrame.url || event.sender.getURL());
+  return isSameFrame && isAllowedContentUrl(senderFrame.url || event.sender.getURL());
 }
 
 ipcMain.on('publish-unread-state', (event, rawPayload) => {
@@ -642,6 +667,7 @@ function recoverUnexpectedInPageNavigation(url, isMainFrame) {
   const classification = classifyNavigationUrl(url);
   if (classification === 'internal') {
     lastAllowedAppUrl = url;
+    applyUnreadRoutePolicy(url);
     return;
   }
 
@@ -688,7 +714,10 @@ function createWindow() {
     recoverUnexpectedInPageNavigation(url, isMainFrame);
   });
   win.webContents.on('did-navigate', (_event, url) => {
-    if (isAllowedAppUrl(url)) lastAllowedAppUrl = url;
+    if (isAllowedAppUrl(url)) {
+      lastAllowedAppUrl = url;
+      applyUnreadRoutePolicy(url);
+    }
   });
   win.webContents.on('will-prevent-unload', (event) => {
     permitUnloadForApplicationQuit(event, isQuitting);

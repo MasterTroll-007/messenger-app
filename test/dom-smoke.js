@@ -142,6 +142,82 @@ function fixtureHtml() {
   </html>`;
 }
 
+function delayedNavFixtureHtml() {
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: auto; font-family: sans-serif; }
+        #top { height: 56px; width: 100%; background: #222; }
+        #app { position: absolute; inset: 56px 0 auto 0; height: calc(100vh - 56px); display: flex; overflow: hidden; }
+        nav { flex: 0 0 320px; width: 320px; height: 100%; background: #18191a; overflow: auto; }
+        nav[style*="display: none"] { display: none !important; }
+        a.thread { position: relative; display: flex; height: 64px; align-items: center; color: white; }
+        a.thread img { width: 40px; height: 40px; }
+        main { flex: 1 1 auto; min-width: 0; height: 100%; background: #242526; overflow: hidden; }
+        [role="region"] { display: flex; flex-direction: column; height: calc(100% - 24px); max-height: calc(100vh - 100px); }
+        .messages { flex: 1 1 auto; min-height: 0; }
+        .composer { flex: 0 0 60px; height: 60px; }
+        [role="textbox"] { display: block; width: calc(100% - 40px); height: 36px; }
+      </style>
+      <script>
+        window.addEventListener('DOMContentLoaded', () => {
+          setTimeout(() => {
+            document.querySelector('#reload-nav').style.display = 'block';
+          }, 1300);
+        }, { once: true });
+      </script>
+    </head>
+    <body>
+      <header id="top" role="banner">Facebook chrome</header>
+      <div id="app">
+        <nav id="reload-nav" role="navigation" aria-label="Conversation list" style="display: none">
+          <h1>Chats</h1><div role="search"><input></div>
+          <a id="reload-row" class="thread" data-unread="true" href="https://www.facebook.com/messages/t/reload">
+            <img alt=""><span dir="auto">Reload</span><span dir="auto">Unread after reload</span>
+            <button aria-label="Mark as read"></button>
+          </a>
+          <button aria-label="Inbox switcher">Inbox</button>
+        </nav>
+        <main id="reload-main" role="main">
+          <section role="region">
+            <div class="messages">Messages</div>
+            <div class="composer"><div role="textbox" contenteditable="true"></div></div>
+          </section>
+        </main>
+      </div>
+    </body>
+  </html>`;
+}
+
+function missingNavFixtureHtml() {
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: auto; font-family: sans-serif; }
+        #top { height: 56px; width: 100%; background: #222; }
+        main { height: calc(100vh - 56px); margin-top: 56px; background: #242526; overflow: hidden; }
+        [role="region"] { display: flex; flex-direction: column; height: 100%; }
+        .messages { flex: 1 1 auto; min-height: 0; }
+        .composer { flex: 0 0 60px; height: 60px; }
+        [role="textbox"] { display: block; width: calc(100% - 40px); height: 36px; }
+      </style>
+    </head>
+    <body>
+      <header id="top" role="banner">Facebook chrome</header>
+      <main id="missing-main" role="main">
+        <section role="region">
+          <div class="messages">Messages skeleton without a conversation list</div>
+          <div class="composer"><div role="textbox" contenteditable="true"></div></div>
+        </section>
+      </main>
+    </body>
+  </html>`;
+}
+
 async function run() {
   await app.whenReady();
   const win = new BrowserWindow({
@@ -169,6 +245,9 @@ async function run() {
       throw new Error(`renderer script #${executedScriptCount} failed (${excerpt}): ${error.message}`);
     }
   };
+  win.webContents.on('did-navigate', () => {
+    win.webContents.send('unread-route-policy', { clear: false, content: true });
+  });
   let focusSink = null;
 
   try {
@@ -824,8 +903,8 @@ async function run() {
     `);
     await waitFor(() => publishedStates.some((state) => state.count === 0), 'preview-first cleanup missing');
 
-    // The DOM message can arrive before a lagging title prefix changes from
-    // zero. The stale title must not erase the only toast/sound event.
+    // The DOM message can arrive while a lagging page-title hint still reports
+    // zero. That correlation-only hint must not override the message-only count.
     win.webContents.send('title-unread-hint', { available: true, count: 0 });
     await delay(25);
     publishedStates.length = 0;
@@ -866,24 +945,22 @@ async function run() {
       'Another hello',
     );
 
-    // Facebook title counts are useful for the badge but carry no sender or
-    // preview. They must never create message toasts or sounds; a following
+    // Facebook title counts can include general activity. They must never
+    // change the message-only badge or create a toast/sound; a following
     // DOM-confirmed message must still retain its rich metadata.
     await delay(1050);
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
     await delay(50);
-    assert.equal(publishedStates.some((state) => state.notify), false, 'first title value after an unavailable gap notified');
+    assert.equal(publishedStates.length, 0, 'first title-only value changed the message badge');
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 2 });
-    await waitFor(() => publishedStates.some((state) => state.count === 2), 'title badge update missing');
-    const titleOnlyState = publishedStates.findLast((state) => state.count === 2);
-    assert.equal(titleOnlyState.notify, false);
-    assert.equal(Object.hasOwn(titleOnlyState, 'message'), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'general Facebook activity changed the message badge');
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`document.querySelector('#preview-a').textContent = 'Different message after title event'`);
     await waitFor(
-      () => publishedStates.some((state) => state.count === 2 && state.notify && state.message),
+      () => publishedStates.some((state) => state.count === 1 && state.notify && state.message),
       'DOM-confirmed message after a title update lost its toast metadata',
     );
     assert.deepEqual(
@@ -897,9 +974,8 @@ async function run() {
     );
     publishedStates.length = 0;
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
-    await waitFor(() => publishedStates.some((state) => state.count === 3), 'following title badge update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'later Facebook activity changed the message badge');
 
     // A different thread still produces exactly one DOM-owned message toast
     // while a title count remains available.
@@ -918,8 +994,8 @@ async function run() {
       window.__crossSourceRow.querySelectorAll('[dir="auto"]')[1].textContent = 'Distinct DOM-first message';
     `);
     await waitFor(
-      () => publishedStates.some((state) => state.count === 3 && state.notify && state.message),
-      'title badge masked a DOM-confirmed message',
+      () => publishedStates.some((state) => state.count === 2 && state.notify && state.message),
+      'Facebook activity masked a DOM-confirmed message',
     );
     assert.deepEqual(publishedStates.findLast((state) => state.message).message, {
       threadId: 'cross-source',
@@ -1584,7 +1660,8 @@ async function run() {
     await delay(100);
     win.webContents.send('title-unread-hint', { available: true, count: 5 });
     await waitFor(
-      () => publishedStates.some((state) => state.notify
+      () => publishedStates.some((state) => state.count === 2
+        && state.notify
         && state.message?.threadId === 'new-message-after-title'),
       'DOM-first new conversation was not corroborated by the later title increase',
     );
@@ -2315,33 +2392,15 @@ async function run() {
     await delay(150);
     assert.equal(publishedStates.length, 0, 'inactive nav kept publishing mutations');
 
+    // Title-only activity, including availability flaps, must leave the zero
+    // unread-conversation state untouched.
     win.webContents.send('title-unread-hint', { available: true, count: 1 });
-    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title fallback baseline missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    await waitFor(() => publishedStates.some((state) => state.count === 0), 'title zero transition missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 0).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: true, count: 1 });
-    await waitFor(() => publishedStates.some((state) => state.count === 1), 'title availability recovery missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 1).notify, false);
-
-    publishedStates.length = 0;
-    win.webContents.send('title-unread-hint', { available: true, count: 2 });
-    await waitFor(() => publishedStates.some((state) => state.count === 2), 'post-baseline title update missing');
-    assert.equal(publishedStates.findLast((state) => state.count === 2).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
-
-    publishedStates.length = 0;
+    await delay(20);
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
     await delay(20);
     win.webContents.send('title-unread-hint', { available: true, count: 3 });
-    await waitFor(() => publishedStates.some((state) => state.count === 3), 'brief title flap lost a real count increase');
-    assert.equal(publishedStates.findLast((state) => state.count === 3).notify, false);
-    assert.equal(publishedStates.some((state) => state.message), false);
+    await delay(100);
+    assert.equal(publishedStates.length, 0, 'title-only activity changed the zero message badge');
 
     await win.webContents.executeJavaScript(`
       document.querySelector('#live-nav')?.remove();
@@ -2367,9 +2426,9 @@ async function run() {
       && document.querySelectorAll('[data-messenger-app-resize-handle]').length === 1
     `), 'empty fallback nav was not discovered after its first thread link arrived');
 
-    // Keep the title source out of this tracker-only boundary test.
+    // Make the title hint unavailable before this tracker-only boundary test.
     win.webContents.send('title-unread-hint', { available: false, count: 0 });
-    await waitFor(() => publishedStates.some((state) => state.count === 0), 'late nav DOM fallback missing');
+    await delay(25);
     await win.webContents.executeJavaScript(`(() => {
       const nav = document.querySelector('#late-nav');
       const fragment = document.createDocumentFragment();
@@ -2409,7 +2468,333 @@ async function run() {
       8000,
     );
 
-    console.log('DOM smoke passed: layout recovery, remounts, message-only notifications, LRU boundaries, virtualization, and title badge fallback.');
+    const retainedCountBeforeReload = publishedStates.findLast(
+      (state) => Number.isSafeInteger(state.count),
+    )?.count;
+    assert.ok(retainedCountBeforeReload > 0, 'retained unread count unavailable before reload baseline');
+    publishedStates.length = 0;
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(delayedNavFixtureHtml())}`);
+    await delay(150);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'late-discovery reload published before its first DOM snapshot',
+    );
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 1),
+      'late-discovery reload unread baseline missing',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      1,
+      'late-discovery reload cleared the retained unread count before the DOM baseline',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.count === 0),
+      false,
+      'late-discovery reload published a synthetic zero',
+    );
+    publishedStates.length = 0;
+    const missingNavStartedAt = Date.now();
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(missingNavFixtureHtml())}`);
+    await delay(2500);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'Messages reload without a nav published before the verification grace elapsed',
+    );
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'Messages reload without a nav never retired the stale unread count',
+      20000,
+    );
+    assert.ok(
+      Date.now() - missingNavStartedAt >= 14500,
+      'Messages reload without a nav retired stale state before the 15s verification grace',
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'Messages reload without a nav published a stale unread baseline',
+    );
+    publishedStates.length = 0;
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(delayedNavFixtureHtml())}`);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'post-reload auth/media baseline missing',
+      8000,
+    );
+
+    // Main owns route classification. A same-document auth detour clears the
+    // native state and invalidates the old DOM snapshot. Returning to Messages
+    // must wait for a fresh conversation-list snapshot, even if its count is
+    // unchanged from before auth.
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: true, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'same-document auth route did not suspend the unread tracker');
+    assert.equal(publishedStates.length, 0, 'auth route published from an unverified DOM snapshot');
+    await win.webContents.executeJavaScript(`
+      window.__authRoundTripNav = document.querySelector('#reload-nav');
+      window.__authRoundTripNav.remove();
+    `);
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: false, content: true });
+    await delay(150);
+    assert.equal(
+      publishedStates.some((state) => state.count > 0),
+      false,
+      'return from auth restored a stale count before fresh DOM verification',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#reload-main').before(window.__authRoundTripNav);
+      delete window.__authRoundTripNav;
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'fresh post-auth DOM count was not published',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'auth round-trip generated a message notification',
+    );
+
+    // A photo/media SPA can keep its nav connected while its rows hydrate from
+    // zero unread to unread. A live zero-unread baseline must clear retained
+    // state immediately instead of waiting for the content verification timer.
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'photo/media route did not suspend the unread tracker');
+    assert.deepEqual(
+      await win.webContents.executeJavaScript(`({
+        mounted: document.body.classList.contains('messenger-app-mounted'),
+        root: document.querySelector('#app')?.hasAttribute('data-messenger-app-viewport-root') === true,
+        nav: document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav') === true,
+        banner: document.querySelector('#top')?.hasAttribute('data-messenger-app-global-banner') === true,
+        resizeHandleCount: document.querySelectorAll('[data-messenger-app-resize-handle]').length,
+      })`),
+      {
+        mounted: true,
+        root: true,
+        nav: true,
+        banner: true,
+        resizeHandleCount: 1,
+      },
+      'photo/media route tore down the managed Messenger layout',
+    );
+    await win.webContents.executeJavaScript(`
+      window.__mediaViewportHeightBeforeResize = document.querySelector('#app')
+        .style.getPropertyValue('--messenger-app-viewport-height');
+      document.querySelector('#app').removeAttribute('data-messenger-app-viewport-root');
+    `);
+    await win.setContentSize(1200, 760);
+    await waitFor(async () => win.webContents.executeJavaScript(`(() => {
+      const app = document.querySelector('#app');
+      return app.hasAttribute('data-messenger-app-viewport-root')
+        && app.style.getPropertyValue('--messenger-app-viewport-height')
+          !== window.__mediaViewportHeightBeforeResize
+        && !document.querySelector('#reload-row [data-messenger-app-compact-text]');
+    })()`), 'photo/media retained layout did not repair/reflow while the tracker stayed paused');
+    await win.webContents.executeJavaScript(`delete window.__mediaViewportHeightBeforeResize`);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'photo/media layout repair published unread state while the tracker was paused',
+    );
+    await win.webContents.executeJavaScript(`
+      const row = document.querySelector('#reload-row');
+      row.removeAttribute('data-unread');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Hydrating from a live zero-unread row';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'photo/media DOM churn changed unread state while the tracker was paused',
+    );
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `Boolean(document.querySelector('#reload-row [data-messenger-app-compact-text]'))`,
+    ), 'return from photo/media did not remount the unread tracker');
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'live zero-unread hydration never cleared the retained count',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'live zero-unread hydration did not become the first verified baseline',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'live zero-unread hydration generated a notification',
+    );
+
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'second photo/media transition did not suspend the unread tracker');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const row = document.querySelector('#reload-row');
+      row.setAttribute('data-unread', 'true');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as read');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Unread again after hydration';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'second photo/media DOM churn changed unread state while the tracker was paused',
+    );
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'rehydrated unread baseline missing',
+      8000,
+    );
+
+    // An immediately recognized empty labelled nav must keep the retained
+    // count until a real conversation row appears.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'third photo/media transition did not suspend the unread tracker');
+    await win.webContents.executeJavaScript(`
+      window.__mediaRetainedRow = document.querySelector('#reload-row');
+      window.__mediaRetainedRow.remove();
+    `);
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await delay(2500);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'empty labelled nav published before a real row appeared',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#reload-nav').appendChild(window.__mediaRetainedRow);
+      delete window.__mediaRetainedRow;
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'empty labelled nav never published after its first row appeared',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      retainedCountBeforeReload,
+      'empty labelled nav published a synthetic zero before its first row',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'empty labelled nav remount generated a notification',
+    );
+
+    // Re-establish a verified zero before the missing-nav timeout case so the
+    // 15s fallback must force-publish exactly one zero instead of relying on a
+    // count transition.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'fourth photo/media transition did not suspend the unread tracker');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const row = document.querySelector('#reload-row');
+      row.removeAttribute('data-unread');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Zero baseline before missing nav';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'pre-missing-nav media DOM churn changed unread state while the tracker was paused',
+    );
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'zero baseline before missing nav was never published',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'zero baseline before missing nav was not DOM-verified',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'zero baseline before missing nav generated a notification',
+    );
+
+    // If Messages returns without any conversation list after a verified zero,
+    // start a fresh content gap and force-publish exactly one timeout zero.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'fifth photo/media transition did not suspend the unread tracker');
+    await win.webContents.executeJavaScript(`document.querySelector('#reload-nav').remove()`);
+    publishedStates.length = 0;
+    const missingMediaNavStartedAt = Date.now();
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await delay(2500);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'Messages return without a nav published before the 15s verification grace',
+    );
+    await waitFor(
+      () => publishedStates.length === 1 && publishedStates[0].count === 0,
+      'Messages route without a nav never force-published the zero timeout state',
+      20000,
+    );
+    assert.ok(
+      Date.now() - missingMediaNavStartedAt >= 14500,
+      'Messages return without a nav used the short structure-gap timeout',
+    );
+    await delay(200);
+    assert.equal(
+      publishedStates.length,
+      1,
+      'Messages return without a nav published duplicate zero timeout states',
+    );
+    assert.equal(
+      publishedStates[0].notify,
+      false,
+      'Messages return without a nav generated a timeout notification',
+    );
+
+    console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');
   } finally {
     if (focusSink && !focusSink.isDestroyed()) focusSink.destroy();
     if (!win.isDestroyed()) win.destroy();

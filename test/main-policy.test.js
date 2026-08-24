@@ -18,6 +18,7 @@ const {
   normalizeRequestedMediaTypes,
   parseUnreadCountFromTitle,
   permitUnloadForApplicationQuit,
+  shouldClearUnreadStateForUrl,
   shouldHandleUpdateAvailable,
   soundHeaderMatchesExtension,
   TOAST_ACTIVATOR_CLSID,
@@ -50,13 +51,63 @@ test('app URLs require HTTPS, an exact host, and an approved route', () => {
   assert.equal(isAllowedAppUrl('https://www.facebook.com/messenger_media/?attachment_id=123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo/?fbid=123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php?fbid=123'), true);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php/?fbid=123'), true);
   assert.equal(isAllowedAppUrl('https://facebook.com/login.php?next=%2Fmessages'), true);
   assert.equal(isAllowedAppUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/profile.php?id=1'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php/anything?fbid=123'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.phpfoo'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php.evil'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/login.php/anything?next=%2Fmessages'), false);
   assert.equal(isAllowedAppUrl('https://evil.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('http://www.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com:444/messages/'), false);
   assert.equal(isAllowedAppUrl('javascript:alert(1)'), false);
+});
+
+test('only committed authentication routes clear the persisted unread state', () => {
+  const facebookAuthPaths = [
+    '/login',
+    '/login.php?next=%2Fmessages',
+    '/login.php/?next=%2Fmessages',
+    '/checkpoint/',
+    '/recover/',
+    '/two_step_verification/',
+    '/auth_platform/',
+    '/privacy/consent/',
+    '/cookie/consent/',
+    '/dialog/oauth/',
+    '/oauth/',
+  ];
+  for (const host of ['facebook.com', 'www.facebook.com', 'm.facebook.com']) {
+    for (const authPath of facebookAuthPaths) {
+      assert.equal(shouldClearUnreadStateForUrl(`https://${host}${authPath}`), true);
+    }
+  }
+  for (const host of ['messenger.com', 'www.messenger.com']) {
+    assert.equal(shouldClearUnreadStateForUrl(`https://${host}/login/?next=%2Ft%2F1`), true);
+    assert.equal(shouldClearUnreadStateForUrl(`https://${host}/checkpoint/`), true);
+  }
+
+  const retainedUrls = [
+    'https://www.facebook.com/messages/',
+    'https://www.facebook.com/messages/t/123',
+    'https://www.facebook.com/messenger_media/?attachment_id=123',
+    'https://www.facebook.com/photo/?fbid=123',
+    'https://www.facebook.com/photo.php?fbid=123',
+    'https://www.facebook.com/photo.php/anything?fbid=123',
+    'https://www.messenger.com/',
+    'https://www.messenger.com/t/123',
+    'https://www.facebook.com/login.php/anything?next=%2Fmessages',
+    'https://www.facebook.com/login.phpfoo',
+    'https://evil.facebook.com/login.php',
+    'http://www.facebook.com/login.php',
+    'https://www.facebook.com:444/login.php',
+    'not a URL',
+  ];
+  for (const url of retainedUrls) {
+    assert.equal(shouldClearUnreadStateForUrl(url), false);
+  }
 });
 
 test('external URL policy allows only safe schemes and never reclassifies app URLs', () => {
@@ -71,6 +122,8 @@ test('external URL policy allows only safe schemes and never reclassifies app UR
   );
   assert.equal(classifyNavigationUrl('https://www.facebook.com/photo/?fbid=123'), 'internal');
   assert.equal(classifyNavigationUrl('https://www.facebook.com/photo.php?fbid=123'), 'internal');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/photo.php/anything?fbid=123'), 'external');
+  assert.equal(classifyNavigationUrl('https://www.facebook.com/login.php/anything?next=%2Fmessages'), 'external');
   assert.equal(classifyNavigationUrl('https://www.facebook.com/marketplace/'), 'external');
   assert.equal(classifyNavigationUrl('https://example.com/'), 'external');
   assert.equal(classifyNavigationUrl('data:text/html,hello'), 'blocked');
