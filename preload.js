@@ -2491,7 +2491,6 @@ window.addEventListener('DOMContentLoaded', () => {
   let rendererUnreadRoutePhase = 'unknown';
   let structureTimerId = null;
   let structureGapTimer = null;
-  let structureGapDeadline = -Infinity;
   let structureGapGeneration = 0;
   let pendingDomSnapshot = null;
   const knownConversationNavs = new WeakSet(
@@ -2510,7 +2509,6 @@ window.addEventListener('DOMContentLoaded', () => {
     structureGapGeneration += 1;
     if (structureGapTimer !== null) clearTimeout(structureGapTimer);
     structureGapTimer = null;
-    structureGapDeadline = -Infinity;
     pendingDomSnapshot = null;
   };
 
@@ -2551,28 +2549,30 @@ window.addEventListener('DOMContentLoaded', () => {
     if (pendingFreshDomVerification || structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
     structureGapGeneration = generation;
-    structureGapDeadline = performance.now() + STRUCTURE_GAP_GRACE_MS;
     pendingDomSnapshot = null;
     structureGapTimer = setTimeout(() => {
       if (generation !== structureGapGeneration) return;
       structureGapTimer = null;
-      structureGapDeadline = -Infinity;
       const pending = pendingDomSnapshot;
       pendingDomSnapshot = null;
 
       if (activeNav && activeMain) {
+        if ((!pending || !snapshotHasLiveRows(pending))
+          && latestUnreadRoutePolicy?.content === true) {
+          clearContentVerificationGap();
+          contentVerificationExpired = false;
+          pendingFreshDomVerification = true;
+          beginContentVerificationGap();
+          return;
+        }
         if (pending && !snapshotHasLiveRows(pending)) {
-          if (latestUnreadRoutePolicy?.content === true) {
-            clearContentVerificationGap();
-            contentVerificationExpired = false;
-            pendingFreshDomVerification = true;
-            beginContentVerificationGap();
-          }
           return;
         }
         if (pending) {
-          clearContentVerificationGap();
-          pendingFreshDomVerification = false;
+          if (latestUnreadRoutePolicy?.content === true) {
+            clearContentVerificationGap();
+            pendingFreshDomVerification = false;
+          }
           domSnapshot = { ...pending, notify: false };
           lastVerifiedDomCount = domSnapshot.count;
           publishCanonicalState(false, 'structure');
@@ -2592,8 +2592,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const verifyingFreshContent = pendingFreshDomVerification
       && latestUnreadRoutePolicy?.content === true;
     if (verifyingFreshContent && !snapshotHasLiveRows(snapshot)) return;
-    const gapActive = structureGapTimer !== null
-      && performance.now() < structureGapDeadline;
+    const gapActive = structureGapTimer !== null;
     if (gapActive && !snapshotHasLiveRows(snapshot)) {
       pendingDomSnapshot = snapshot;
       return;
@@ -2722,39 +2721,27 @@ window.addEventListener('DOMContentLoaded', () => {
       return;
     }
     let nextNav = findVisibleConversationList();
-    if (!nextNav && isElementStructurallyShown(activeNav)) nextNav = activeNav;
     let nextMain = nextNav ? findVisibleMain(nextNav) : null;
-    if (!nextMain && nextNav === activeNav && isElementStructurallyShown(activeMain)) {
-      nextMain = activeMain;
-    }
 
     if (!nextNav || !nextMain) {
-      const preserveConnectedTracker = Boolean(activeNav?.isConnected);
-      if (activeNav && !preserveConnectedTracker) unmountNav(true, true);
-      if (!activeNav || !activeMain?.isConnected) activeMain = null;
+      if (activeNav) unmountNav(true, true);
+      else beginStructureGap();
+      activeMain = null;
       clearManagedLayout();
       document.documentElement.classList.remove('messenger-app-mounted');
-      document.body.classList.remove('messenger-app-mounted');
-      if (!preserveConnectedTracker) {
-        document.body.classList.remove(
-          'messenger-app-compact',
-          'messenger-app-menu-hidden',
-        );
-      }
+      document.body.classList.remove(
+        'messenger-app-mounted',
+        'messenger-app-compact',
+        'messenger-app-menu-hidden',
+      );
       clearPageConstraints();
       return;
     }
 
     if (activeNav !== nextNav) {
       if (activeNav) {
-        // A replacement can already contain thread anchors while React is
-        // still hydrating their unread semantics. Any zero snapshot during a
-        // handoff from a nonzero list therefore needs the same fixed grace as
-        // a completely empty skeleton.
-        const replacementNeedsGrace = true;
-        const isNewReplacement = !knownConversationNavs.has(nextNav);
-        const retainHandoff = !activeNav.isConnected || isNewReplacement;
-        unmountNav(!activeNav.isConnected || replacementNeedsGrace, retainHandoff);
+        const retainHandoff = !activeNav.isConnected || !knownConversationNavs.has(nextNav);
+        unmountNav(true, retainHandoff);
       }
       mountNav(nextNav);
     } else if (!unreadTracker) {
