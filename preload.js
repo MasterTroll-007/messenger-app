@@ -2580,14 +2580,11 @@ window.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      domSnapshot = null;
-      retainRouteHandoffUntilVerification = false;
-      pendingHandoffSnapshot = null;
       if (latestUnreadRoutePolicy?.content !== true) return;
       clearContentVerificationGap();
-      pendingFreshDomVerification = false;
-      lastVerifiedDomCount = 0;
-      publishCanonicalState(false, 'structure');
+      contentVerificationExpired = false;
+      pendingFreshDomVerification = true;
+      beginContentVerificationGap();
     }, STRUCTURE_GAP_GRACE_MS);
   };
 
@@ -2754,7 +2751,7 @@ window.addEventListener('DOMContentLoaded', () => {
         // still hydrating their unread semantics. Any zero snapshot during a
         // handoff from a nonzero list therefore needs the same fixed grace as
         // a completely empty skeleton.
-        const replacementNeedsGrace = (domSnapshot?.count || 0) > 0;
+        const replacementNeedsGrace = true;
         const isNewReplacement = !knownConversationNavs.has(nextNav);
         const retainHandoff = !activeNav.isConnected || isNewReplacement;
         unmountNav(!activeNav.isConnected || replacementNeedsGrace, retainHandoff);
