@@ -1074,9 +1074,13 @@ window.addEventListener('DOMContentLoaded', () => {
     const finalizeFreshVerification = () => {
       retireRetainedRouteHandoff();
       [...threadState.entries()].forEach(([id, state]) => {
-        if (state.present === false || state.visible === true) return;
+        if (state.present === false
+          || state.visible === true
+          || state.retainedRouteImported !== true) return;
         cancelPendingNotification(id);
         cancelPendingReadNotification(id);
+        identityCandidates.delete(id);
+        identitySettledIds.delete(id);
         touchState(id, {
           ...state,
           counted: false,
@@ -1407,13 +1411,16 @@ window.addEventListener('DOMContentLoaded', () => {
         if (!existingState && handoffStillValid && transferredStates.has(nextId)) {
           const transferred = transferredStates.get(nextId);
           transferredStates.delete(nextId);
+          const retainedRouteImported = transferred.retainedRouteImported === true
+            || retainedRouteHandoffActive;
           existingState = {
             ...transferred,
-            counted: true,
+            counted: retainedRouteImported ? transferred.counted !== false : true,
             missingSince: null,
             pendingReadSignature: null,
             pendingReadUntil: -Infinity,
             present: true,
+            retainedRouteImported,
           };
           touchState(nextId, existingState);
           importedHandoff = true;
@@ -1752,6 +1759,8 @@ window.addEventListener('DOMContentLoaded', () => {
             pendingReadUntil = -Infinity;
           }
         }
+        const retainedRouteImported = previous?.retainedRouteImported === true
+          && visible !== true;
         touchState(id, {
           incoming: nextIncoming,
           unread,
@@ -1760,12 +1769,19 @@ window.addEventListener('DOMContentLoaded', () => {
           pendingUnreadTransition,
           present: true,
           visible,
-          counted: true,
+          counted: retainedRouteImported ? false : true,
           missingSince: null,
           message: nextMessage,
           pendingReadSignature,
           pendingReadUntil,
+          retainedRouteImported,
         });
+        if (retainedRouteImported) {
+          cancelPendingNotification(id);
+          cancelPendingReadNotification(id);
+          identityCandidates.delete(id);
+          identitySettledIds.delete(id);
+        }
         if (identitySettled) identityCandidates.delete(id);
       }
       trimState();
@@ -2440,6 +2456,11 @@ window.addEventListener('DOMContentLoaded', () => {
     retireTitleIncreasesThrough(latestTitleIncrease.generation);
   };
 
+  const invalidateTitleBaseline = () => {
+    lastObservedTitleCount = null;
+    retireTitleIncreasesThrough(latestTitleIncrease.generation);
+  };
+
   const effectiveVerifiedCountIsZero = () => (
     domSnapshot
       ? (domSnapshot.presentCount ?? domSnapshot.count) === 0
@@ -2750,7 +2771,7 @@ window.addEventListener('DOMContentLoaded', () => {
       suspendUnreadTracking(false);
       domSnapshot = null;
       lastVerifiedDomCount = null;
-      resetTitleBaselineForVerifiedZero();
+      invalidateTitleBaseline();
       lastPublishedCount = 0;
       contentVerificationExpired = false;
       pendingFreshDomVerification = false;
