@@ -142,6 +142,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const MAX_NAV_WIDTH_PX = 600;
   const MAX_TRACKED_THREADS = 500;
   const STRUCTURE_GAP_GRACE_MS = 1000;
+  const CONTENT_VERIFY_GRACE_MS = STRUCTURE_GAP_GRACE_MS * 2;
   const THREAD_LINK_SELECTOR = 'a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]';
   const EDITOR_SELECTOR = '[role="textbox"][contenteditable="true"]';
   const COMPACT_CONTROL_SELECTOR = [
@@ -2342,6 +2343,10 @@ window.addEventListener('DOMContentLoaded', () => {
   let unreadTracker = null;
   let navControls = null;
   let pendingHandoffSnapshot = null;
+  let contentVerificationTimer = null;
+  let contentVerificationGeneration = 0;
+  let pendingFreshDomVerification = false;
+  let rendererUnreadRoutePhase = 'unknown';
   let structureTimerId = null;
   let structureGapTimer = null;
   let structureGapDeadline = -Infinity;
@@ -2367,6 +2372,27 @@ window.addEventListener('DOMContentLoaded', () => {
     pendingDomSnapshot = null;
   };
 
+  const clearContentVerificationGap = () => {
+    contentVerificationGeneration += 1;
+    if (contentVerificationTimer !== null) clearTimeout(contentVerificationTimer);
+    contentVerificationTimer = null;
+  };
+
+  const beginContentVerificationGap = () => {
+    if (!pendingFreshDomVerification || contentVerificationTimer !== null) return;
+    const generation = contentVerificationGeneration + 1;
+    contentVerificationGeneration = generation;
+    contentVerificationTimer = setTimeout(() => {
+      if (generation !== contentVerificationGeneration) return;
+      contentVerificationTimer = null;
+      if (!pendingFreshDomVerification || latestUnreadRoutePolicy?.content !== true) return;
+      pendingFreshDomVerification = false;
+      domSnapshot = null;
+      lastVerifiedDomCount = 0;
+      publishCanonicalState(false, 'structure');
+    }, CONTENT_VERIFY_GRACE_MS);
+  };
+
   const beginStructureGap = () => {
     if (structureGapTimer !== null) return;
     const generation = structureGapGeneration + 1;
@@ -2382,6 +2408,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
       if (activeNav && activeMain) {
         if (pending) {
+          clearContentVerificationGap();
+          pendingFreshDomVerification = false;
           domSnapshot = { ...pending, notify: false };
           lastVerifiedDomCount = domSnapshot.count;
           publishCanonicalState(false, 'structure');
@@ -2392,6 +2420,8 @@ window.addEventListener('DOMContentLoaded', () => {
       domSnapshot = null;
       pendingHandoffSnapshot = null;
       if (latestUnreadRoutePolicy?.content !== true) return;
+      clearContentVerificationGap();
+      pendingFreshDomVerification = false;
       lastVerifiedDomCount = 0;
       publishCanonicalState(false, 'structure');
     }, STRUCTURE_GAP_GRACE_MS);
@@ -2405,6 +2435,8 @@ window.addEventListener('DOMContentLoaded', () => {
       return;
     }
     if (structureGapTimer !== null) clearStructureGap();
+    clearContentVerificationGap();
+    pendingFreshDomVerification = false;
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
@@ -2432,6 +2464,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const suspendUnreadTracking = (retainHandoff) => {
     clearStructureGap();
+    clearContentVerificationGap();
     if (activeNav) unmountNav(false, retainHandoff);
     else if (!retainHandoff) pendingHandoffSnapshot = null;
     activeMain = null;
@@ -2520,6 +2553,8 @@ window.addEventListener('DOMContentLoaded', () => {
       domSnapshot = null;
       lastVerifiedDomCount = null;
       lastPublishedCount = 0;
+      pendingFreshDomVerification = false;
+      rendererUnreadRoutePhase = 'clear';
       return;
     }
 
@@ -2528,13 +2563,24 @@ window.addEventListener('DOMContentLoaded', () => {
         unreadPublishingSuppressed = true;
         suspendUnreadTracking(true);
       }
+      pendingFreshDomVerification = false;
+      rendererUnreadRoutePhase = 'retained';
       return;
     }
 
+    const previousUnreadRoutePhase = rendererUnreadRoutePhase;
+    const enteringContent = previousUnreadRoutePhase !== 'content';
     const shouldRetireRetainedState = latestUnreadRoutePolicy.retireRetained === true;
     unreadPublishingSuppressed = false;
+    if (enteringContent) {
+      pendingFreshDomVerification = previousUnreadRoutePhase === 'unknown'
+        ? !domSnapshot
+        : true;
+    }
+    rendererUnreadRoutePhase = 'content';
     reconcileStructureWithoutFeedback();
     if (shouldRetireRetainedState && (!activeNav || !activeMain)) beginStructureGap();
+    if (pendingFreshDomVerification) beginContentVerificationGap();
   };
 
   const isDirectStructuralCandidate = (node) => {

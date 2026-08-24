@@ -191,6 +191,33 @@ function delayedNavFixtureHtml() {
   </html>`;
 }
 
+function missingNavFixtureHtml() {
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: auto; font-family: sans-serif; }
+        #top { height: 56px; width: 100%; background: #222; }
+        main { height: calc(100vh - 56px); margin-top: 56px; background: #242526; overflow: hidden; }
+        [role="region"] { display: flex; flex-direction: column; height: 100%; }
+        .messages { flex: 1 1 auto; min-height: 0; }
+        .composer { flex: 0 0 60px; height: 60px; }
+        [role="textbox"] { display: block; width: calc(100% - 40px); height: 36px; }
+      </style>
+    </head>
+    <body>
+      <header id="top" role="banner">Facebook chrome</header>
+      <main id="missing-main" role="main">
+        <section role="region">
+          <div class="messages">Messages skeleton without a conversation list</div>
+          <div class="composer"><div role="textbox" contenteditable="true"></div></div>
+        </section>
+      </main>
+    </body>
+  </html>`;
+}
+
 async function run() {
   await app.whenReady();
   const win = new BrowserWindow({
@@ -2467,6 +2494,31 @@ async function run() {
       publishedStates.some((state) => state.count === 0),
       false,
       'late-discovery reload published a synthetic zero',
+    );
+    publishedStates.length = 0;
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(missingNavFixtureHtml())}`);
+    await delay(150);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'Messages reload without a nav published before the verification grace elapsed',
+    );
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'Messages reload without a nav never retired the stale unread count',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'Messages reload without a nav published a stale unread baseline',
+    );
+    publishedStates.length = 0;
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(delayedNavFixtureHtml())}`);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'post-reload auth/media baseline missing',
+      8000,
     );
 
     // Main owns route classification. A same-document auth detour clears the
