@@ -1106,8 +1106,8 @@ window.addEventListener('DOMContentLoaded', () => {
           }
         });
 
-        // Update the DOM snapshot even when an available title hint currently
-        // masks it; a later title-format change must not revive stale unread.
+        // Publish the DOM-owned count even while a title hint is available so
+        // later title churn cannot revive stale unread rows.
         publishCountIfChanged();
         if (recoveredPresentThread) scheduleFlush();
         scheduleMissingExpiry();
@@ -2292,7 +2292,8 @@ window.addEventListener('DOMContentLoaded', () => {
     rawMessage = null,
   ) {
     // Facebook's title prefix can count general activity notifications. The
-    // native badge must represent only unread Messenger conversation rows.
+    // tray, taskbar, title, and badge counts must come only from unread
+    // Messenger conversation rows.
     const count = domSnapshot ? domSnapshot.count : lastVerifiedDomCount;
     if (!Number.isSafeInteger(count) || count < 0) return;
     const message = notify && source === 'dom' ? rawMessage : null;
@@ -2309,7 +2310,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
   // A title prefix has no sender or preview and can include non-message
   // Facebook activity. Keep it only as corroboration for a newly inserted
-  // conversation row; it must never drive a badge, toast, or sound by itself.
+  // conversation row; it must never drive a count surface, toast, or sound by
+  // itself.
   handleTitleHint = () => {
     if (!latestTitleHint.available
       && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
