@@ -2,85 +2,6 @@
 
 const { ipcRenderer } = require('electron');
 
-// Electron's sandboxed preload only exposes a restricted `require`, so keep
-// the auth-route matcher local instead of importing a sibling module.
-const FACEBOOK_AUTH_HOSTS = new Set([
-  'facebook.com',
-  'www.facebook.com',
-  'm.facebook.com',
-]);
-const MESSENGER_AUTH_HOSTS = new Set([
-  'messenger.com',
-  'www.messenger.com',
-]);
-const FACEBOOK_CONTENT_PATHS = [
-  /^\/messages(?:\/|$)/,
-];
-const FACEBOOK_AUTH_PATHS = [
-  /^\/login(?:\.php|\/|$)/,
-  /^\/checkpoint(?:\/|$)/,
-  /^\/recover(?:\/|$)/,
-  /^\/two_step_verification(?:\/|$)/,
-  /^\/auth_platform(?:\/|$)/,
-  /^\/(?:privacy|cookie)\/consent(?:\/|$)/,
-  /^\/dialog\/oauth(?:\/|$)/,
-  /^\/oauth(?:\/|$)/,
-];
-const MESSENGER_CONTENT_PATHS = [
-  /^\/$/,
-  /^\/t(?:\/|$)/,
-];
-const MESSENGER_AUTH_PATHS = [
-  /^\/login(?:\/|$)/,
-  /^\/checkpoint(?:\/|$)/,
-];
-
-function parsePolicyUrl(rawUrl) {
-  if (typeof rawUrl !== 'string' || rawUrl.length === 0 || rawUrl.length > 8192) return null;
-
-  try {
-    const url = new URL(rawUrl);
-    if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
-    return url;
-  } catch {
-    return null;
-  }
-}
-
-function isContentConversationUrl(rawUrl) {
-  const url = parsePolicyUrl(rawUrl);
-  if (!url) return false;
-
-  const hostname = url.hostname.toLowerCase();
-  if (FACEBOOK_AUTH_HOSTS.has(hostname)) {
-    return FACEBOOK_CONTENT_PATHS.some((pattern) => pattern.test(url.pathname));
-  }
-
-  return MESSENGER_AUTH_HOSTS.has(hostname)
-    && MESSENGER_CONTENT_PATHS.some((pattern) => pattern.test(url.pathname));
-}
-
-function shouldClearUnreadStateForUrl(rawUrl) {
-  const url = parsePolicyUrl(rawUrl);
-  if (!url) return false;
-
-  const hostname = url.hostname.toLowerCase();
-  if (FACEBOOK_AUTH_HOSTS.has(hostname)) {
-    return FACEBOOK_AUTH_PATHS.some((pattern) => pattern.test(url.pathname));
-  }
-
-  return MESSENGER_AUTH_HOSTS.has(hostname)
-    && MESSENGER_AUTH_PATHS.some((pattern) => pattern.test(url.pathname));
-}
-
-function shouldExpireRetainedUnreadState(rawUrl, lastVerifiedUrl) {
-  return shouldClearUnreadStateForUrl(rawUrl)
-    || isContentConversationUrl(rawUrl)
-    || (typeof rawUrl === 'string'
-      && typeof lastVerifiedUrl === 'string'
-      && rawUrl === lastVerifiedUrl);
-}
-
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
 let notificationAudio = null;
@@ -88,6 +9,8 @@ let notificationAudioVersion = 0;
 let playScheduled = false;
 let lastAudioStart = -Infinity;
 let audioActionGeneration = 0;
+let latestUnreadRoutePolicy = null;
+let handleUnreadRoutePolicy = null;
 
 function getNotificationAudio() {
   if (!notificationAudio) {
@@ -134,6 +57,17 @@ function reloadNotificationAudio() {
 ipcRenderer.on('play-notification-sound', scheduleNotificationSound);
 ipcRenderer.on('stop-notification-sound', stopNotificationSound);
 ipcRenderer.on('notification-sound-updated', reloadNotificationAudio);
+ipcRenderer.on('unread-route-policy', (_event, rawPolicy) => {
+  const clear = rawPolicy?.clear === true;
+  latestUnreadRoutePolicy = {
+    clear,
+    content: !clear && rawPolicy?.content === true,
+    retireRetained: !clear
+      && rawPolicy?.content === true
+      && rawPolicy?.retireRetained === true,
+  };
+  handleUnreadRoutePolicy?.();
+});
 
 let latestTitleHint = { available: false, count: 0 };
 let handleTitleHint = null;
@@ -2333,7 +2267,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let domSnapshot = null;
   let lastPublishedCount = null;
   let lastVerifiedDomCount = null;
-  let lastVerifiedDomUrl = null;
+  let unreadPublishingSuppressed = false;
   let lastBadgeCount = null;
   let lastBadgeDataUrl = null;
 
@@ -2371,6 +2305,7 @@ window.addEventListener('DOMContentLoaded', () => {
     source = 'structure',
     rawMessage = null,
   ) {
+    if (unreadPublishingSuppressed) return;
     // Facebook's title prefix can count general activity notifications. The
     // tray, taskbar, title, and badge counts must come only from unread
     // Messenger conversation rows.
@@ -2449,7 +2384,6 @@ window.addEventListener('DOMContentLoaded', () => {
         if (pending) {
           domSnapshot = { ...pending, notify: false };
           lastVerifiedDomCount = domSnapshot.count;
-          lastVerifiedDomUrl = window.location.href;
           publishCanonicalState(false, 'structure');
         }
         return;
@@ -2457,9 +2391,8 @@ window.addEventListener('DOMContentLoaded', () => {
 
       domSnapshot = null;
       pendingHandoffSnapshot = null;
-      if (!shouldExpireRetainedUnreadState(window.location.href, lastVerifiedDomUrl)) return;
+      if (latestUnreadRoutePolicy?.content !== true) return;
       lastVerifiedDomCount = 0;
-      lastVerifiedDomUrl = window.location.href;
       publishCanonicalState(false, 'structure');
     }, STRUCTURE_GAP_GRACE_MS);
   };
@@ -2474,7 +2407,6 @@ window.addEventListener('DOMContentLoaded', () => {
     if (structureGapTimer !== null) clearStructureGap();
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
-    lastVerifiedDomUrl = window.location.href;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
@@ -2498,6 +2430,21 @@ window.addEventListener('DOMContentLoaded', () => {
     if (publishFallback) beginStructureGap();
   };
 
+  const suspendUnreadTracking = (retainHandoff) => {
+    clearStructureGap();
+    if (activeNav) unmountNav(false, retainHandoff);
+    else if (!retainHandoff) pendingHandoffSnapshot = null;
+    activeMain = null;
+    clearManagedLayout();
+    document.documentElement.classList.remove('messenger-app-mounted');
+    document.body.classList.remove(
+      'messenger-app-mounted',
+      'messenger-app-compact',
+      'messenger-app-menu-hidden',
+    );
+    clearPageConstraints();
+  };
+
   const scheduleStructure = () => {
     if (structureTimerId !== null) return;
     structureTimerId = setTimeout(() => {
@@ -2518,6 +2465,7 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   function reconcileStructure() {
+    if (unreadPublishingSuppressed) return;
     let nextNav = findVisibleConversationList();
     if (!nextNav && isElementStructurallyShown(activeNav)) nextNav = activeNav;
     let nextMain = nextNav ? findVisibleMain(nextNav) : null;
@@ -2562,6 +2510,32 @@ window.addEventListener('DOMContentLoaded', () => {
     applyManagedLayout(nextNav, nextMain);
     navControls?.refresh();
   }
+
+  handleUnreadRoutePolicy = () => {
+    if (!latestUnreadRoutePolicy) return;
+
+    if (latestUnreadRoutePolicy.clear) {
+      unreadPublishingSuppressed = true;
+      suspendUnreadTracking(false);
+      domSnapshot = null;
+      lastVerifiedDomCount = null;
+      lastPublishedCount = 0;
+      return;
+    }
+
+    if (!latestUnreadRoutePolicy.content) {
+      if (!unreadPublishingSuppressed) {
+        unreadPublishingSuppressed = true;
+        suspendUnreadTracking(true);
+      }
+      return;
+    }
+
+    const shouldRetireRetainedState = latestUnreadRoutePolicy.retireRetained === true;
+    unreadPublishingSuppressed = false;
+    reconcileStructureWithoutFeedback();
+    if (shouldRetireRetainedState && (!activeNav || !activeMain)) beginStructureGap();
+  };
 
   const isDirectStructuralCandidate = (node) => {
     if (node?.nodeType !== Node.ELEMENT_NODE) return false;
@@ -2741,6 +2715,7 @@ window.addEventListener('DOMContentLoaded', () => {
   window.visualViewport?.addEventListener('resize', onViewportChange, { passive: true });
   window.visualViewport?.addEventListener('scroll', onViewportChange, { passive: true });
 
-  reconcileStructureWithoutFeedback();
+  handleUnreadRoutePolicy();
+  if (!latestUnreadRoutePolicy) reconcileStructureWithoutFeedback();
   publishCanonicalState(false, 'structure');
 }, { once: true });

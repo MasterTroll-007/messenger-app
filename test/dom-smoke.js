@@ -165,7 +165,7 @@ function delayedNavFixtureHtml() {
         window.addEventListener('DOMContentLoaded', () => {
           setTimeout(() => {
             document.querySelector('#reload-nav').style.display = 'block';
-          }, 300);
+          }, 1300);
         }, { once: true });
       </script>
     </head>
@@ -218,6 +218,9 @@ async function run() {
       throw new Error(`renderer script #${executedScriptCount} failed (${excerpt}): ${error.message}`);
     }
   };
+  win.webContents.on('did-navigate', () => {
+    win.webContents.send('unread-route-policy', { clear: false, content: true });
+  });
   let focusSink = null;
 
   try {
@@ -2464,6 +2467,96 @@ async function run() {
       publishedStates.some((state) => state.count === 0),
       false,
       'late-discovery reload published a synthetic zero',
+    );
+
+    // Main owns route classification. A same-document auth detour clears the
+    // native state and invalidates the old DOM snapshot. Returning to Messages
+    // must wait for a fresh conversation-list snapshot, even if its count is
+    // unchanged from before auth.
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: true, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'same-document auth route did not suspend the unread tracker');
+    assert.equal(publishedStates.length, 0, 'auth route published from an unverified DOM snapshot');
+    await win.webContents.executeJavaScript(`
+      window.__authRoundTripNav = document.querySelector('#reload-nav');
+      window.__authRoundTripNav.remove();
+    `);
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: false, content: true });
+    await delay(150);
+    assert.equal(
+      publishedStates.some((state) => state.count > 0),
+      false,
+      'return from auth restored a stale count before fresh DOM verification',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#reload-main').before(window.__authRoundTripNav);
+      delete window.__authRoundTripNav;
+    `);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === retainedCountBeforeReload),
+      'fresh post-auth DOM count was not published',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'auth round-trip generated a message notification',
+    );
+
+    // A photo/media SPA can keep its nav connected while removing its rows.
+    // Suspend the tracker so that hidden/emptied message DOM cannot overwrite
+    // the last main-owned count or generate a notification.
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'photo/media route did not suspend the unread tracker');
+    await win.webContents.executeJavaScript(`
+      window.__mediaRetainedRow = document.querySelector('#reload-row');
+      window.__mediaRetainedRow.remove();
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'photo/media DOM churn changed unread state or generated a notification',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#reload-nav').appendChild(window.__mediaRetainedRow);
+      delete window.__mediaRetainedRow;
+    `);
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'return from photo/media did not remount the unread tracker');
+    assert.equal(
+      publishedStates.some((state) => state.count === 0 || state.notify),
+      false,
+      'return from photo/media changed the retained unread state',
+    );
+
+    // If Messages returns without any conversation list, start a fresh content
+    // gap so the retained media count cannot survive forever.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-nav')?.hasAttribute('data-messenger-app-nav')`,
+    ), 'second photo/media transition did not suspend the unread tracker');
+    await win.webContents.executeJavaScript(`document.querySelector('#reload-nav').remove()`);
+    publishedStates.length = 0;
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'Messages route without a nav never retired the retained media count',
     );
 
     console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');

@@ -51,9 +51,12 @@ test('app URLs require HTTPS, an exact host, and an approved route', () => {
   assert.equal(isAllowedAppUrl('https://www.facebook.com/messenger_media/?attachment_id=123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo/?fbid=123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php?fbid=123'), true);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php/?fbid=123'), true);
   assert.equal(isAllowedAppUrl('https://facebook.com/login.php?next=%2Fmessages'), true);
   assert.equal(isAllowedAppUrl('https://www.messenger.com/t/123'), true);
   assert.equal(isAllowedAppUrl('https://www.facebook.com/profile.php?id=1'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.phpfoo'), false);
+  assert.equal(isAllowedAppUrl('https://www.facebook.com/photo.php.evil'), false);
   assert.equal(isAllowedAppUrl('https://evil.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('http://www.facebook.com/messages/'), false);
   assert.equal(isAllowedAppUrl('https://www.facebook.com:444/messages/'), false);
@@ -64,6 +67,7 @@ test('only committed authentication routes clear the persisted unread state', ()
   const facebookAuthPaths = [
     '/login',
     '/login.php?next=%2Fmessages',
+    '/login.php/?next=%2Fmessages',
     '/checkpoint/',
     '/recover/',
     '/two_step_verification/',
@@ -91,6 +95,7 @@ test('only committed authentication routes clear the persisted unread state', ()
     'https://www.facebook.com/photo.php?fbid=123',
     'https://www.messenger.com/',
     'https://www.messenger.com/t/123',
+    'https://www.facebook.com/login.phpfoo',
     'https://evil.facebook.com/login.php',
     'http://www.facebook.com/login.php',
     'https://www.facebook.com:444/login.php',
