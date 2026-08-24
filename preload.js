@@ -1,7 +1,85 @@
 'use strict';
 
 const { ipcRenderer } = require('electron');
-const { shouldClearUnreadStateForUrl } = require('./lib/main-policy');
+
+// Electron's sandboxed preload only exposes a restricted `require`, so keep
+// the auth-route matcher local instead of importing a sibling module.
+const FACEBOOK_AUTH_HOSTS = new Set([
+  'facebook.com',
+  'www.facebook.com',
+  'm.facebook.com',
+]);
+const MESSENGER_AUTH_HOSTS = new Set([
+  'messenger.com',
+  'www.messenger.com',
+]);
+const FACEBOOK_CONTENT_PATHS = [
+  /^\/messages(?:\/|$)/,
+];
+const FACEBOOK_AUTH_PATHS = [
+  /^\/login(?:\.php|\/|$)/,
+  /^\/checkpoint(?:\/|$)/,
+  /^\/recover(?:\/|$)/,
+  /^\/two_step_verification(?:\/|$)/,
+  /^\/auth_platform(?:\/|$)/,
+  /^\/(?:privacy|cookie)\/consent(?:\/|$)/,
+  /^\/dialog\/oauth(?:\/|$)/,
+  /^\/oauth(?:\/|$)/,
+];
+const MESSENGER_CONTENT_PATHS = [
+  /^\/$/,
+  /^\/t(?:\/|$)/,
+];
+const MESSENGER_AUTH_PATHS = [
+  /^\/login(?:\/|$)/,
+  /^\/checkpoint(?:\/|$)/,
+];
+
+function parsePolicyUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0 || rawUrl.length > 8192) return null;
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function isContentConversationUrl(rawUrl) {
+  const url = parsePolicyUrl(rawUrl);
+  if (!url) return false;
+
+  const hostname = url.hostname.toLowerCase();
+  if (FACEBOOK_AUTH_HOSTS.has(hostname)) {
+    return FACEBOOK_CONTENT_PATHS.some((pattern) => pattern.test(url.pathname));
+  }
+
+  return MESSENGER_AUTH_HOSTS.has(hostname)
+    && MESSENGER_CONTENT_PATHS.some((pattern) => pattern.test(url.pathname));
+}
+
+function shouldClearUnreadStateForUrl(rawUrl) {
+  const url = parsePolicyUrl(rawUrl);
+  if (!url) return false;
+
+  const hostname = url.hostname.toLowerCase();
+  if (FACEBOOK_AUTH_HOSTS.has(hostname)) {
+    return FACEBOOK_AUTH_PATHS.some((pattern) => pattern.test(url.pathname));
+  }
+
+  return MESSENGER_AUTH_HOSTS.has(hostname)
+    && MESSENGER_AUTH_PATHS.some((pattern) => pattern.test(url.pathname));
+}
+
+function shouldExpireRetainedUnreadState(rawUrl, lastVerifiedUrl) {
+  return shouldClearUnreadStateForUrl(rawUrl)
+    || isContentConversationUrl(rawUrl)
+    || (typeof rawUrl === 'string'
+      && typeof lastVerifiedUrl === 'string'
+      && rawUrl === lastVerifiedUrl);
+}
 
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
@@ -2255,6 +2333,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let domSnapshot = null;
   let lastPublishedCount = null;
   let lastVerifiedDomCount = null;
+  let lastVerifiedDomUrl = null;
   let lastBadgeCount = null;
   let lastBadgeDataUrl = null;
 
@@ -2370,6 +2449,7 @@ window.addEventListener('DOMContentLoaded', () => {
         if (pending) {
           domSnapshot = { ...pending, notify: false };
           lastVerifiedDomCount = domSnapshot.count;
+          lastVerifiedDomUrl = window.location.href;
           publishCanonicalState(false, 'structure');
         }
         return;
@@ -2377,8 +2457,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
       domSnapshot = null;
       pendingHandoffSnapshot = null;
-      if (!shouldClearUnreadStateForUrl(window.location.href)) return;
+      if (!shouldExpireRetainedUnreadState(window.location.href, lastVerifiedDomUrl)) return;
       lastVerifiedDomCount = 0;
+      lastVerifiedDomUrl = window.location.href;
       publishCanonicalState(false, 'structure');
     }, STRUCTURE_GAP_GRACE_MS);
   };
@@ -2393,6 +2474,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (structureGapTimer !== null) clearStructureGap();
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
+    lastVerifiedDomUrl = window.location.href;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);
