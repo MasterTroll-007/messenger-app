@@ -2253,6 +2253,7 @@ window.addEventListener('DOMContentLoaded', () => {
 
   let domSnapshot = null;
   let lastPublishedCount = null;
+  let lastVerifiedDomCount = null;
   let lastBadgeCount = null;
   let lastBadgeDataUrl = null;
 
@@ -2292,7 +2293,8 @@ window.addEventListener('DOMContentLoaded', () => {
   ) {
     // Facebook's title prefix can count general activity notifications. The
     // native badge must represent only unread Messenger conversation rows.
-    const count = domSnapshot?.count || 0;
+    const count = domSnapshot ? domSnapshot.count : lastVerifiedDomCount;
+    if (!Number.isSafeInteger(count) || count < 0) return;
     const message = notify && source === 'dom' ? rawMessage : null;
     if (!notify && !message && count === lastPublishedCount) return;
     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
@@ -2364,12 +2366,14 @@ window.addEventListener('DOMContentLoaded', () => {
       if (activeNav && activeMain) {
         if (pending) {
           domSnapshot = { ...pending, notify: false };
+          lastVerifiedDomCount = domSnapshot.count;
           publishCanonicalState(false, 'structure');
         }
         return;
       }
 
       domSnapshot = null;
+      lastVerifiedDomCount = 0;
       pendingHandoffSnapshot = null;
       publishCanonicalState(false, 'structure');
     }, STRUCTURE_GAP_GRACE_MS);
@@ -2384,6 +2388,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     if (structureGapTimer !== null) clearStructureGap();
     domSnapshot = snapshot;
+    lastVerifiedDomCount = snapshot.count;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
       lastObservedTitleCount = 0;
       retireTitleIncreasesThrough(latestTitleIncrease.generation);

@@ -142,6 +142,55 @@ function fixtureHtml() {
   </html>`;
 }
 
+function delayedNavFixtureHtml() {
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: auto; font-family: sans-serif; }
+        #top { height: 56px; width: 100%; background: #222; }
+        #app { position: absolute; inset: 56px 0 auto 0; height: calc(100vh - 56px); display: flex; overflow: hidden; }
+        nav { flex: 0 0 320px; width: 320px; height: 100%; background: #18191a; overflow: auto; }
+        nav[style*="display: none"] { display: none !important; }
+        a.thread { position: relative; display: flex; height: 64px; align-items: center; color: white; }
+        a.thread img { width: 40px; height: 40px; }
+        main { flex: 1 1 auto; min-width: 0; height: 100%; background: #242526; overflow: hidden; }
+        [role="region"] { display: flex; flex-direction: column; height: calc(100% - 24px); max-height: calc(100vh - 100px); }
+        .messages { flex: 1 1 auto; min-height: 0; }
+        .composer { flex: 0 0 60px; height: 60px; }
+        [role="textbox"] { display: block; width: calc(100% - 40px); height: 36px; }
+      </style>
+      <script>
+        window.addEventListener('DOMContentLoaded', () => {
+          setTimeout(() => {
+            document.querySelector('#reload-nav').style.display = 'block';
+          }, 300);
+        }, { once: true });
+      </script>
+    </head>
+    <body>
+      <header id="top" role="banner">Facebook chrome</header>
+      <div id="app">
+        <nav id="reload-nav" role="navigation" aria-label="Conversation list" style="display: none">
+          <h1>Chats</h1><div role="search"><input></div>
+          <a id="reload-row" class="thread" data-unread="true" href="https://www.facebook.com/messages/t/reload">
+            <img alt=""><span dir="auto">Reload</span><span dir="auto">Unread after reload</span>
+            <button aria-label="Mark as read"></button>
+          </a>
+          <button aria-label="Inbox switcher">Inbox</button>
+        </nav>
+        <main id="reload-main" role="main">
+          <section role="region">
+            <div class="messages">Messages</div>
+            <div class="composer"><div role="textbox" contenteditable="true"></div></div>
+          </section>
+        </main>
+      </div>
+    </body>
+  </html>`;
+}
+
 async function run() {
   await app.whenReady();
   const win = new BrowserWindow({
@@ -2387,6 +2436,34 @@ async function run() {
       () => publishedStates.some((state) => state.count === 1 && state.notify),
       'mid-batch LRU eviction dropped the oldest read-to-unread notification',
       8000,
+    );
+
+    const retainedCountBeforeReload = publishedStates.findLast(
+      (state) => Number.isSafeInteger(state.count),
+    )?.count;
+    assert.ok(retainedCountBeforeReload > 0, 'retained unread count unavailable before reload baseline');
+    publishedStates.length = 0;
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(delayedNavFixtureHtml())}`);
+    await delay(150);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'late-discovery reload published before its first DOM snapshot',
+    );
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 1),
+      'late-discovery reload unread baseline missing',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      1,
+      'late-discovery reload cleared the retained unread count before the DOM baseline',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.count === 0),
+      false,
+      'late-discovery reload published a synthetic zero',
     );
 
     console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');
