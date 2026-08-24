@@ -2815,6 +2815,7 @@ window.addEventListener('DOMContentLoaded', () => {
         unreadPublishingSuppressed = true;
         pauseUnreadTracking(true);
       }
+      lastPublishedCount = null;
       contentVerificationExpired = false;
       pendingFreshDomVerification = false;
       rendererUnreadRoutePhase = 'retained';
