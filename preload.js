@@ -996,6 +996,13 @@ window.addEventListener('DOMContentLoaded', () => {
     let lastReportedCount = null;
     let lastReportedPresentCount = null;
     let lastReportedRowCount = null;
+    const retireRetainedRouteHandoff = () => {
+      if (!retainedRouteHandoffActive) return;
+      retainedRouteHandoffActive = false;
+      transferredStates.clear();
+      transferredPendingNotifications.clear();
+      transferredPendingReadNotifications.clear();
+    };
 
     const currentCount = () => {
       let count = 0;
@@ -1081,7 +1088,7 @@ window.addEventListener('DOMContentLoaded', () => {
         notify: false,
         presentCount,
         rowCount,
-      });
+      }, retireRetainedRouteHandoff);
     };
 
     function scheduleMissingExpiry() {
@@ -1266,7 +1273,7 @@ window.addEventListener('DOMContentLoaded', () => {
           message: current.message,
           presentCount: currentPresentCount(),
           rowCount: currentRowCount(),
-        });
+        }, retireRetainedRouteHandoff);
       };
       pending.timer = setTimeout(check, Math.max(0, Math.ceil(deadline - performance.now())));
       pendingNotifications.set(id, pending);
@@ -1958,13 +1965,7 @@ window.addEventListener('DOMContentLoaded', () => {
         }
       },
       cancelPendingNotificationsForForeground,
-      retireRetainedRouteHandoff() {
-        if (!retainedRouteHandoffActive) return;
-        retainedRouteHandoffActive = false;
-        transferredStates.clear();
-        transferredPendingNotifications.clear();
-        transferredPendingReadNotifications.clear();
-      },
+      retireRetainedRouteHandoff,
       snapshotState() {
         const cloneState = (state) => ({
           ...state,
@@ -2479,7 +2480,7 @@ window.addEventListener('DOMContentLoaded', () => {
     }, STRUCTURE_GAP_GRACE_MS);
   };
 
-  const acceptDomSnapshot = (snapshot) => {
+  const acceptDomSnapshot = (snapshot, retireRetainedRouteHandoff = null) => {
     if (pendingFreshDomVerification
       && latestUnreadRoutePolicy?.content === true
       && !snapshotHasLiveRows(snapshot)) return;
@@ -2494,7 +2495,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (pendingFreshDomVerification
       && latestUnreadRoutePolicy?.content === true
       && snapshotHasLiveRows(snapshot)) {
-      unreadTracker?.retireRetainedRouteHandoff?.();
+      retireRetainedRouteHandoff?.();
     }
     pendingFreshDomVerification = false;
     retainRouteHandoffUntilVerification = false;
@@ -2573,8 +2574,8 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const mountUnreadTracker = (nav) => {
-    unreadTracker = setupUnreadTracker(nav, (snapshot) => {
-      acceptDomSnapshot(snapshot);
+    unreadTracker = setupUnreadTracker(nav, (snapshot, retireRetainedRouteHandoff) => {
+      acceptDomSnapshot(snapshot, retireRetainedRouteHandoff);
     }, { handoffSnapshot: pendingHandoffSnapshot });
     pendingHandoffSnapshot = null;
   };
