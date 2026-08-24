@@ -2561,6 +2561,15 @@ window.addEventListener('DOMContentLoaded', () => {
       pendingDomSnapshot = null;
 
       if (activeNav && activeMain) {
+        if (pending && !snapshotHasLiveRows(pending)) {
+          if (latestUnreadRoutePolicy?.content === true) {
+            clearContentVerificationGap();
+            contentVerificationExpired = false;
+            pendingFreshDomVerification = true;
+            beginContentVerificationGap();
+          }
+          return;
+        }
         if (pending) {
           clearContentVerificationGap();
           pendingFreshDomVerification = false;
@@ -2588,7 +2597,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (verifyingFreshContent && !snapshotHasLiveRows(snapshot)) return;
     const gapActive = structureGapTimer !== null
       && performance.now() < structureGapDeadline;
-    if (gapActive && (domSnapshot?.count || 0) > 0 && !snapshotHasLiveRows(snapshot)) {
+    if (gapActive && !snapshotHasLiveRows(snapshot)) {
       pendingDomSnapshot = snapshot;
       return;
     }
