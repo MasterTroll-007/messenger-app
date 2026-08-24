@@ -1,6 +1,7 @@
 'use strict';
 
 const { ipcRenderer } = require('electron');
+const { shouldClearUnreadStateForUrl } = require('./lib/main-policy');
 
 const SOUND_URL = 'messenger-asset://notification/sound';
 const AUDIO_COALESCE_MS = 300;
@@ -2375,8 +2376,9 @@ window.addEventListener('DOMContentLoaded', () => {
       }
 
       domSnapshot = null;
-      lastVerifiedDomCount = 0;
       pendingHandoffSnapshot = null;
+      if (!shouldClearUnreadStateForUrl(window.location.href)) return;
+      lastVerifiedDomCount = 0;
       publishCanonicalState(false, 'structure');
     }, STRUCTURE_GAP_GRACE_MS);
   };
