@@ -2324,6 +2324,7 @@ window.addEventListener('DOMContentLoaded', () => {
     notify = false,
     source = 'structure',
     rawMessage = null,
+    forcePublish = false,
   ) {
     if (unreadPublishingSuppressed) return;
     // Facebook's title prefix can count general activity notifications. The
@@ -2332,7 +2333,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const count = domSnapshot ? domSnapshot.count : lastVerifiedDomCount;
     if (!Number.isSafeInteger(count) || count < 0) return;
     const message = notify && source === 'dom' ? rawMessage : null;
-    if (!notify && !message && count === lastPublishedCount) return;
+    if (!forcePublish && !notify && !message && count === lastPublishedCount) return;
     const badgeDataUrl = count > 0 ? createBadgeDataUrl(count) : null;
     ipcRenderer.send('publish-unread-state', {
       count,
@@ -2408,7 +2409,7 @@ window.addEventListener('DOMContentLoaded', () => {
       pendingFreshDomVerification = false;
       domSnapshot = null;
       lastVerifiedDomCount = 0;
-      publishCanonicalState(false, 'structure');
+      publishCanonicalState(false, 'structure', null, true);
     }, CONTENT_VERIFY_GRACE_MS);
   };
 
@@ -2543,7 +2544,18 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   function reconcileStructure() {
-    if (unreadPublishingSuppressed) return;
+    if (unreadPublishingSuppressed) {
+      if (rendererUnreadRoutePhase === 'retained'
+        && activeNav?.isConnected
+        && activeMain?.isConnected) {
+        document.documentElement.classList.add('messenger-app-mounted');
+        document.body.classList.add('messenger-app-mounted');
+        applyPageConstraints();
+        applyManagedLayout(activeNav, activeMain);
+        navControls?.refresh();
+      }
+      return;
+    }
     let nextNav = findVisibleConversationList();
     if (!nextNav && isElementStructurallyShown(activeNav)) nextNav = activeNav;
     let nextMain = nextNav ? findVisibleMain(nextNav) : null;

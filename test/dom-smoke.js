@@ -2588,6 +2588,25 @@ async function run() {
       'photo/media route tore down the managed Messenger layout',
     );
     await win.webContents.executeJavaScript(`
+      window.__mediaViewportHeightBeforeResize = document.querySelector('#app')
+        .style.getPropertyValue('--messenger-app-viewport-height');
+      document.querySelector('#app').removeAttribute('data-messenger-app-viewport-root');
+    `);
+    await win.setContentSize(1200, 760);
+    await waitFor(async () => win.webContents.executeJavaScript(`(() => {
+      const app = document.querySelector('#app');
+      return app.hasAttribute('data-messenger-app-viewport-root')
+        && app.style.getPropertyValue('--messenger-app-viewport-height')
+          !== window.__mediaViewportHeightBeforeResize
+        && !document.querySelector('#reload-row [data-messenger-app-compact-text]');
+    })()`), 'photo/media retained layout did not repair/reflow while the tracker stayed paused');
+    await win.webContents.executeJavaScript(`delete window.__mediaViewportHeightBeforeResize`);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'photo/media layout repair published unread state while the tracker was paused',
+    );
+    await win.webContents.executeJavaScript(`
       const row = document.querySelector('#reload-row');
       row.removeAttribute('data-unread');
       row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
@@ -2693,12 +2712,53 @@ async function run() {
       'empty labelled nav remount generated a notification',
     );
 
-    // If Messages returns without any conversation list, start a fresh content
-    // gap so the retained media count cannot survive forever.
+    // Re-establish a verified zero before the missing-nav timeout case so the
+    // 15s fallback must force-publish exactly one zero instead of relying on a
+    // count transition.
     win.webContents.send('unread-route-policy', { clear: false, content: false });
     await waitFor(async () => win.webContents.executeJavaScript(
       `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
     ), 'fourth photo/media transition did not suspend the unread tracker');
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`
+      const row = document.querySelector('#reload-row');
+      row.removeAttribute('data-unread');
+      row.querySelector('button').setAttribute('aria-label', 'Mark as unread');
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Zero baseline before missing nav';
+    `);
+    await delay(1200);
+    assert.equal(
+      publishedStates.length,
+      0,
+      'pre-missing-nav media DOM churn changed unread state while the tracker was paused',
+    );
+    win.webContents.send('unread-route-policy', {
+      clear: false,
+      content: true,
+      retireRetained: true,
+    });
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 0),
+      'zero baseline before missing nav was never published',
+      8000,
+    );
+    assert.equal(
+      publishedStates.find((state) => Number.isSafeInteger(state.count))?.count,
+      0,
+      'zero baseline before missing nav was not DOM-verified',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.notify),
+      false,
+      'zero baseline before missing nav generated a notification',
+    );
+
+    // If Messages returns without any conversation list after a verified zero,
+    // start a fresh content gap and force-publish exactly one timeout zero.
+    win.webContents.send('unread-route-policy', { clear: false, content: false });
+    await waitFor(async () => win.webContents.executeJavaScript(
+      `!document.querySelector('#reload-row [data-messenger-app-compact-text]')`,
+    ), 'fifth photo/media transition did not suspend the unread tracker');
     await win.webContents.executeJavaScript(`document.querySelector('#reload-nav').remove()`);
     publishedStates.length = 0;
     const missingMediaNavStartedAt = Date.now();
@@ -2714,13 +2774,24 @@ async function run() {
       'Messages return without a nav published before the 15s verification grace',
     );
     await waitFor(
-      () => publishedStates.some((state) => state.count === 0),
-      'Messages route without a nav never retired the retained media count',
+      () => publishedStates.length === 1 && publishedStates[0].count === 0,
+      'Messages route without a nav never force-published the zero timeout state',
       20000,
     );
     assert.ok(
       Date.now() - missingMediaNavStartedAt >= 14500,
       'Messages return without a nav used the short structure-gap timeout',
+    );
+    await delay(200);
+    assert.equal(
+      publishedStates.length,
+      1,
+      'Messages return without a nav published duplicate zero timeout states',
+    );
+    assert.equal(
+      publishedStates[0].notify,
+      false,
+      'Messages return without a nav generated a timeout notification',
     );
 
     console.log('DOM smoke passed: layout recovery, remounts, message-only badges/notifications, LRU boundaries, virtualization, and title correlation.');
