@@ -2344,15 +2344,24 @@ window.addEventListener('DOMContentLoaded', () => {
     lastPublishedCount = count;
   }
 
+  const resetTitleBaselineForVerifiedZero = () => {
+    lastObservedTitleCount = 0;
+    retireTitleIncreasesThrough(latestTitleIncrease.generation);
+  };
+
+  const effectiveVerifiedCountIsZero = () => (
+    domSnapshot
+      ? (domSnapshot.presentCount ?? domSnapshot.count) === 0
+      : lastVerifiedDomCount === 0
+  );
+
   // A title prefix has no sender or preview and can include non-message
   // Facebook activity. Keep it only as corroboration for a newly inserted
   // conversation row; it must never drive a count surface, toast, or sound by
   // itself.
   handleTitleHint = () => {
-    if (!latestTitleHint.available
-      && (domSnapshot?.presentCount ?? domSnapshot?.count) === 0) {
-      lastObservedTitleCount = 0;
-      retireTitleIncreasesThrough(latestTitleIncrease.generation);
+    if (!latestTitleHint.available && effectiveVerifiedCountIsZero()) {
+      resetTitleBaselineForVerifiedZero();
     }
     unreadTracker?.noteTitleHint();
     publishCanonicalState(false, 'title');
@@ -2468,8 +2477,7 @@ window.addEventListener('DOMContentLoaded', () => {
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
-      lastObservedTitleCount = 0;
-      retireTitleIncreasesThrough(latestTitleIncrease.generation);
+      resetTitleBaselineForVerifiedZero();
     }
     publishCanonicalState(
       snapshot.notify,
