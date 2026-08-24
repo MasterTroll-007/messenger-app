@@ -1318,8 +1318,9 @@ window.addEventListener('DOMContentLoaded', () => {
       if (nextId) {
         let existingState = threadState.get(nextId);
         let importedHandoff = false;
-        const handoffStillValid = performance.now()
-          <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
+        const handoffStillValid = handoffSnapshot?.retainedRouteHandoff === true
+          || performance.now()
+            <= (handoffSnapshot?.capturedAt || -Infinity) + (STRUCTURE_GAP_GRACE_MS * 2);
         if (!existingState && handoffStillValid && transferredStates.has(nextId)) {
           const transferred = transferredStates.get(nextId);
           transferredStates.delete(nextId);
@@ -2372,6 +2373,7 @@ window.addEventListener('DOMContentLoaded', () => {
   let unreadTracker = null;
   let navControls = null;
   let pendingHandoffSnapshot = null;
+  let retainRouteHandoffUntilVerification = false;
   let contentVerificationTimer = null;
   let contentVerificationGeneration = 0;
   let pendingFreshDomVerification = false;
@@ -2416,9 +2418,15 @@ window.addEventListener('DOMContentLoaded', () => {
       contentVerificationTimer = null;
       if (!pendingFreshDomVerification || latestUnreadRoutePolicy?.content !== true) return;
       pendingFreshDomVerification = false;
+      retainRouteHandoffUntilVerification = false;
+      pendingHandoffSnapshot = null;
+      unreadTracker?.cleanup();
+      unreadTracker = null;
       domSnapshot = null;
       lastVerifiedDomCount = 0;
+      if (!latestTitleHint.available) resetTitleBaselineForVerifiedZero();
       publishCanonicalState(false, 'structure', null, true);
+      if (activeNav?.isConnected && activeMain?.isConnected) mountUnreadTracker(activeNav);
     }, CONTENT_VERIFY_GRACE_MS);
   };
 
@@ -2452,6 +2460,7 @@ window.addEventListener('DOMContentLoaded', () => {
       }
 
       domSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
       pendingHandoffSnapshot = null;
       if (latestUnreadRoutePolicy?.content !== true) return;
       clearContentVerificationGap();
@@ -2474,6 +2483,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (structureGapTimer !== null) clearStructureGap();
     clearContentVerificationGap();
     pendingFreshDomVerification = false;
+    retainRouteHandoffUntilVerification = false;
     domSnapshot = snapshot;
     lastVerifiedDomCount = snapshot.count;
     if ((snapshot.presentCount ?? snapshot.count) === 0 && !latestTitleHint.available) {
@@ -2488,9 +2498,15 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const unmountNav = (publishFallback = true, retainHandoff = false) => {
     if (retainHandoff) {
-      pendingHandoffSnapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      const snapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      pendingHandoffSnapshot = snapshot
+        ? retainRouteHandoffUntilVerification
+          ? { ...snapshot, retainedRouteHandoff: true }
+          : snapshot
+        : null;
     } else {
       pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
     }
     unreadTracker?.cleanup();
     navControls?.cleanup();
@@ -2504,9 +2520,12 @@ window.addEventListener('DOMContentLoaded', () => {
     clearStructureGap();
     clearContentVerificationGap();
     if (retainHandoff) {
-      pendingHandoffSnapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      const snapshot = unreadTracker?.snapshotState() || pendingHandoffSnapshot;
+      retainRouteHandoffUntilVerification = true;
+      pendingHandoffSnapshot = snapshot ? { ...snapshot, retainedRouteHandoff: true } : null;
     } else {
       pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
     }
     unreadTracker?.cleanup();
     unreadTracker = null;
@@ -2516,7 +2535,10 @@ window.addEventListener('DOMContentLoaded', () => {
     clearStructureGap();
     clearContentVerificationGap();
     if (activeNav) unmountNav(false, retainHandoff);
-    else if (!retainHandoff) pendingHandoffSnapshot = null;
+    else if (!retainHandoff) {
+      pendingHandoffSnapshot = null;
+      retainRouteHandoffUntilVerification = false;
+    }
     activeMain = null;
     clearManagedLayout();
     document.documentElement.classList.remove('messenger-app-mounted');
