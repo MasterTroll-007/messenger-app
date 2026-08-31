@@ -325,22 +325,6 @@ window.addEventListener('DOMContentLoaded', () => {
     .trim()
     .toLowerCase();
 
-  const isElementStructurallyShown = (element) => {
-    if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
-      return false;
-    }
-    for (let node = element; node; node = node.parentElement) {
-      const computed = getComputedStyle(node);
-      if (computed.display === 'none'
-        || computed.visibility === 'hidden'
-        || computed.visibility === 'collapse') {
-        return false;
-      }
-      if (node === document.body) break;
-    }
-    return true;
-  };
-
   const isElementVisible = (element, { allowZeroWidth = false } = {}) => {
     if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
       return false;
@@ -366,7 +350,31 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   };
 
-  const isTrackedThreadLinkStructurallyLive = (link) => isElementStructurallyShown(link);
+  const isTrackedThreadLinkStructurallyLive = (link) => {
+    const scopedNav = link?.closest?.('[data-messenger-app-nav]');
+    if (!link?.isConnected || !scopedNav) return false;
+
+    // The selected Messenger shell can be aria-hidden while a modal/overlay
+    // is open even though its live conversation list keeps receiving updates.
+    // Ignore only aria-hidden at/above that boundary. Real hidden/inert/CSS
+    // caches and hidden duplicate rows inside the list remain ineligible.
+    let insideSelectedList = true;
+    for (let node = link; node; node = node.parentElement) {
+      if (node.matches('[hidden], [inert]')) return false;
+      if (insideSelectedList
+        && node !== scopedNav
+        && node.matches('[aria-hidden="true"]')) return false;
+      const computed = getComputedStyle(node);
+      if (computed.display === 'none'
+        || computed.visibility === 'hidden'
+        || computed.visibility === 'collapse') {
+        return false;
+      }
+      if (node === scopedNav) insideSelectedList = false;
+      if (node === document.body) break;
+    }
+    return true;
+  };
 
   const threadIdentity = (link) => {
     const href = link?.getAttribute('href');
@@ -642,7 +650,7 @@ window.addEventListener('DOMContentLoaded', () => {
     );
   }
 
-  function rowHasUnread(link) {
+  function rowHasUnread(link, { allowStrongTrailingMessage = false } = {}) {
     const candidates = [link, ...link.querySelectorAll('[aria-label], [data-testid], [data-unread]')];
     for (const candidate of candidates.slice(0, 96)) {
       if (candidate.getAttribute('data-unread') === 'true') return true;
@@ -664,7 +672,41 @@ window.addEventListener('DOMContentLoaded', () => {
         return true;
       }
     }
-    return false;
+
+    // Meta's current conversation list no longer exposes an unread aria/data
+    // marker. It renders the sender/preview with font-weight 600 instead. Keep
+    // this fallback scoped to semantic text inside a Messenger thread link so
+    // bold Facebook chrome or general notifications can never affect it.
+    const textNodes = Array.from(link.querySelectorAll('[dir="auto"]'))
+      .filter((node) => !node.querySelector('[dir="auto"]'));
+    const calendarFlags = calendarFilterFlags(textNodes, { allowStrongTrailingMessage });
+    const emphasizedParts = textNodes
+      .filter((_node, index) => !calendarFlags[index])
+      .filter((node) => {
+        if (!normalizeText(node.textContent)) return false;
+        for (let current = node; current; current = current.parentElement) {
+          if (current.matches('[hidden], [inert], [aria-hidden="true"]')) return false;
+          const currentStyle = getComputedStyle(current);
+          if (currentStyle.display === 'none'
+            || currentStyle.visibility === 'hidden'
+            || currentStyle.visibility === 'collapse') return false;
+          if (current === link) break;
+        }
+        return true;
+      })
+      // Exclude latest-activity status lines (reactions, read receipts, typing,
+      // system activity) from the semantic count, using the same classifier
+      // rowDisplayState relies on, so a read thread whose status line also
+      // renders semibold can't be mistaken for an unread message preview.
+      .filter((node) => !isNonMessageRowText(node.textContent))
+      .filter((node) => {
+        const computed = getComputedStyle(node);
+        const fontWeight = Number.parseInt(computed.fontWeight, 10);
+        return Number.isFinite(fontWeight) && fontWeight >= 600;
+      });
+    // A selected/read thread can emphasize its sender alone. Meta's unread
+    // state emphasizes both sender and preview/status semantic parts.
+    return emphasizedParts.length >= 2;
   }
 
   const isCalendarRowText = (text) => {
@@ -677,12 +719,20 @@ window.addEventListener('DOMContentLoaded', () => {
       || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
   };
 
+  // Meta re-renders these elapsed-time labels on a timer, independent of any
+  // real activity, so unlike other calendar-like text they never plausibly
+  // represent a typed message body.
+  const isElapsedDurationRowText = (text) => {
+    const normalized = normalizeText(text);
+    return /^pred\s+(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?$/.test(normalized)
+      || /^\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|tyd)(?:\s+ago)?$/.test(normalized);
+  };
+
   const isStrongCalendarRowText = (text) => {
     const normalized = normalizeText(text);
     return /^(?:now|just now|ted|prave ted|today|dnes|yesterday|vcera)$/.test(normalized)
       || /^(?:(?:at|v)\s+)?\d{1,2}:\d{2}(?:\s*(?:am|pm))?$/.test(normalized)
-      || /^pred\s+(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?$/.test(normalized)
-      || /^\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|tyd)(?:\s+ago)?$/.test(normalized)
+      || isElapsedDurationRowText(text)
       || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
   };
 
@@ -828,6 +878,7 @@ window.addEventListener('DOMContentLoaded', () => {
       .map((priorNode) => cleanDisplayText(priorNode.textContent))
       .filter((priorText) => priorText && !isNonMessageRowText(priorText));
     if (isStrongCalendarRowText(text)) {
+      if (isElapsedDurationRowText(text)) return true;
       return !(allowStrongTrailingMessage && index === 1 && priorParts.length === 1);
     }
     const senderSplit = priorParts.length >= 2 && /:\s*$/u.test(priorParts.at(-1));
@@ -1568,11 +1619,14 @@ window.addEventListener('DOMContentLoaded', () => {
         // Finish all style/layout reads before writing our row markers. A
         // single Messenger commit can dirty many rows, and interleaving these
         // phases would otherwise trigger repeated synchronous layout work.
+        const previousState = threadState.get(id);
+        const allowStrongTrailingMessage = notificationEligibleIds.has(id)
+          && previousState?.stable === true;
         const measuredLinks = allLinks.map((link) => ({
           compactNodes: compactTextNodes(link),
           link,
           structurallyLive: isTrackedThreadLinkStructurallyLive(link),
-          unread: rowHasUnread(link),
+          unread: rowHasUnread(link, { allowStrongTrailingMessage }),
           visible: isTrackedThreadLinkVisible(link),
         }));
         const visibleLinks = measuredLinks.filter((entry) => entry.visible);
@@ -1587,9 +1641,6 @@ window.addEventListener('DOMContentLoaded', () => {
         const contentLinks = unread
           ? unreadLinks
           : links.map((entry) => entry.link);
-        const previousState = threadState.get(id);
-        const allowStrongTrailingMessage = notificationEligibleIds.has(id)
-          && previousState?.stable === true;
         const messageStates = contentLinks.map((link) => rowMessageState(link, id, {
           allowStrongTrailingMessage,
         }));
@@ -2766,16 +2817,24 @@ window.addEventListener('DOMContentLoaded', () => {
     let nextMain = nextNav ? findVisibleMain(nextNav) : null;
 
     if (!nextNav || !nextMain) {
-      if (activeNav) unmountNav(true, true);
-      else beginStructureGap();
-      activeMain = null;
+      const shellIsAriaHidden = (node) => Boolean(node?.closest?.('[aria-hidden="true"]'));
+      const preserveConnectedTracker = Boolean(
+        activeNav?.isConnected
+        && activeMain?.isConnected
+        && (shellIsAriaHidden(activeNav) || shellIsAriaHidden(activeMain)),
+      );
+      if (activeNav && !preserveConnectedTracker) unmountNav(true, true);
+      else if (!activeNav) beginStructureGap();
+      if (!activeNav || !activeMain?.isConnected) activeMain = null;
       clearManagedLayout();
       document.documentElement.classList.remove('messenger-app-mounted');
-      document.body.classList.remove(
-        'messenger-app-mounted',
-        'messenger-app-compact',
-        'messenger-app-menu-hidden',
-      );
+      document.body.classList.remove('messenger-app-mounted');
+      if (!preserveConnectedTracker) {
+        document.body.classList.remove(
+          'messenger-app-compact',
+          'messenger-app-menu-hidden',
+        );
+      }
       clearPageConstraints();
       return;
     }
