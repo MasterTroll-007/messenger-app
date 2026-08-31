@@ -2632,7 +2632,10 @@ window.addEventListener('DOMContentLoaded', () => {
   const acceptDomSnapshot = (snapshot, trackerControls = null) => {
     const onContentRoute = latestUnreadRoutePolicy?.content === true;
     const liveSnapshot = snapshotHasLiveRows(snapshot);
-    if (onContentRoute && !liveSnapshot) {
+    // A background/minimized window can have no row intersecting the viewport.
+    // A notification snapshot has already passed the stricter per-thread
+    // unread, signature, foreground-epoch, and structural-liveness checks.
+    if (onContentRoute && !liveSnapshot && snapshot?.notify !== true) {
       if (structureGapTimer !== null) clearStructureGap();
       if (!pendingFreshDomVerification) {
         clearContentVerificationGap();
