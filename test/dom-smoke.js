@@ -294,6 +294,69 @@ async function run() {
       document.querySelector('#hidden-bold-parts').remove();
     `);
 
+    // A read thread's status line (read receipt, reaction, trailing timestamp)
+    // can also render semibold. Neither is a message preview, so pairing
+    // either with a bold sender must not flip the row unread.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => { node.style.fontWeight = '600'; });
+    })()`);
+    await delay(300);
+    assert.equal(
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#row-b').hasAttribute('data-messenger-app-unread')`,
+      ),
+      false,
+      'bold sender paired with a bold "Seen" receipt marked a read row unread',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = '2h';
+    `);
+    await delay(300);
+    assert.equal(
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#row-b').hasAttribute('data-messenger-app-unread')`,
+      ),
+      false,
+      'bold sender paired with a bold trailing timestamp marked a read row unread',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.count === 2 || state.notify),
+      false,
+      'bold status-line text changed the unread state',
+    );
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => { node.style.removeProperty('font-weight'); });
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    })()`);
+    await delay(300);
+
+    // A real incoming message whose entire body is a calendar-like token
+    // ("Yesterday", "Now", a bare time) must still be detected as unread;
+    // rowHasUnread's fallback must not blanket-exclude it the way a plain
+    // isCalendarRowText filter would.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => { node.style.fontWeight = '600'; });
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Yesterday';
+    })()`);
+    await waitFor(
+      () => publishedStates.some((state) => state.notify && state.message?.threadId === 'b'),
+      'a message whose full body is a calendar-like word was suppressed',
+    );
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => { node.style.removeProperty('font-weight'); });
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+    })()`);
+    await waitFor(
+      () => publishedStates.some((state) => state.count === 1 && !state.notify),
+      'calendar-word message cleanup missing',
+    );
+
     // Meta can mount a read conversation as a name-only skeleton and hydrate
     // its months-old preview afterward. A read row can be rehydrated more than
     // once, but without an unread transition none of those changes is new.

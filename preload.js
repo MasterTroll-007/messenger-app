@@ -650,7 +650,7 @@ window.addEventListener('DOMContentLoaded', () => {
     );
   }
 
-  function rowHasUnread(link) {
+  function rowHasUnread(link, { allowStrongTrailingMessage = false } = {}) {
     const candidates = [link, ...link.querySelectorAll('[aria-label], [data-testid], [data-unread]')];
     for (const candidate of candidates.slice(0, 96)) {
       if (candidate.getAttribute('data-unread') === 'true') return true;
@@ -679,7 +679,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // bold Facebook chrome or general notifications can never affect it.
     const textNodes = Array.from(link.querySelectorAll('[dir="auto"]'))
       .filter((node) => !node.querySelector('[dir="auto"]'));
-    const calendarFlags = calendarFilterFlags(textNodes);
+    const calendarFlags = calendarFilterFlags(textNodes, { allowStrongTrailingMessage });
     const emphasizedParts = textNodes
       .filter((_node, index) => !calendarFlags[index])
       .filter((node) => {
@@ -719,12 +719,20 @@ window.addEventListener('DOMContentLoaded', () => {
       || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
   };
 
+  // Meta re-renders these elapsed-time labels on a timer, independent of any
+  // real activity, so unlike other calendar-like text they never plausibly
+  // represent a typed message body.
+  const isElapsedDurationRowText = (text) => {
+    const normalized = normalizeText(text);
+    return /^pred\s+(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?$/.test(normalized)
+      || /^\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|tyd)(?:\s+ago)?$/.test(normalized);
+  };
+
   const isStrongCalendarRowText = (text) => {
     const normalized = normalizeText(text);
     return /^(?:now|just now|ted|prave ted|today|dnes|yesterday|vcera)$/.test(normalized)
       || /^(?:(?:at|v)\s+)?\d{1,2}:\d{2}(?:\s*(?:am|pm))?$/.test(normalized)
-      || /^pred\s+(?:\d+\s*)?(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|hodinou|hodinami|dnem|dny|dni|tyd|tydnem|tydny|tydnu|mesicem|mesici|mesicu|rokem|roky|lety)(?:\s+(?:ago|zpet))?$/.test(normalized)
-      || /^\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|year|years|hod|tyd)(?:\s+ago)?$/.test(normalized)
+      || isElapsedDurationRowText(text)
       || /^(?:\d{1,2}\s*[./-]\s*\d{1,2}(?:\s*[./-]\s*\d{2,4})?\s*\.?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2}(?:,?\s+\d{4})?|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s+\d{4})?)$/.test(normalized);
   };
 
@@ -870,6 +878,7 @@ window.addEventListener('DOMContentLoaded', () => {
       .map((priorNode) => cleanDisplayText(priorNode.textContent))
       .filter((priorText) => priorText && !isNonMessageRowText(priorText));
     if (isStrongCalendarRowText(text)) {
+      if (isElapsedDurationRowText(text)) return true;
       return !(allowStrongTrailingMessage && index === 1 && priorParts.length === 1);
     }
     const senderSplit = priorParts.length >= 2 && /:\s*$/u.test(priorParts.at(-1));
@@ -1610,11 +1619,14 @@ window.addEventListener('DOMContentLoaded', () => {
         // Finish all style/layout reads before writing our row markers. A
         // single Messenger commit can dirty many rows, and interleaving these
         // phases would otherwise trigger repeated synchronous layout work.
+        const previousState = threadState.get(id);
+        const allowStrongTrailingMessage = notificationEligibleIds.has(id)
+          && previousState?.stable === true;
         const measuredLinks = allLinks.map((link) => ({
           compactNodes: compactTextNodes(link),
           link,
           structurallyLive: isTrackedThreadLinkStructurallyLive(link),
-          unread: rowHasUnread(link),
+          unread: rowHasUnread(link, { allowStrongTrailingMessage }),
           visible: isTrackedThreadLinkVisible(link),
         }));
         const visibleLinks = measuredLinks.filter((entry) => entry.visible);
@@ -1629,9 +1641,6 @@ window.addEventListener('DOMContentLoaded', () => {
         const contentLinks = unread
           ? unreadLinks
           : links.map((entry) => entry.link);
-        const previousState = threadState.get(id);
-        const allowStrongTrailingMessage = notificationEligibleIds.has(id)
-          && previousState?.stable === true;
         const messageStates = contentLinks.map((link) => rowMessageState(link, id, {
           allowStrongTrailingMessage,
         }));
