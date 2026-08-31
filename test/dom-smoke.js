@@ -263,6 +263,37 @@ async function run() {
     const initial = publishedStates.findLast((state) => state.count === 1);
     assert.deepEqual(initial, { count: 1, notify: false, hasBadge: true });
 
+    // A selected/read thread may render only its sender semibold. Hidden
+    // accessibility duplicates can inherit the same weight. Neither is an
+    // unread-message marker.
+    publishedStates.length = 0;
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]')[0].style.fontWeight = '600';
+      const hidden = document.createElement('span');
+      hidden.id = 'hidden-bold-parts';
+      hidden.style.display = 'none';
+      hidden.innerHTML = '<span dir="auto" style="font-weight:600">Hidden sender</span><span dir="auto" style="font-weight:600">Hidden preview</span>';
+      row.appendChild(hidden);
+    })()`);
+    await delay(300);
+    assert.equal(
+      await win.webContents.executeJavaScript(
+        `document.querySelector('#row-b').hasAttribute('data-messenger-app-unread')`,
+      ),
+      false,
+      'sender-only or hidden semibold text marked a read row unread',
+    );
+    assert.equal(
+      publishedStates.some((state) => state.count === 2 || state.notify),
+      false,
+      'sender-only or hidden semibold text changed the unread state',
+    );
+    await win.webContents.executeJavaScript(`
+      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[0].style.removeProperty('font-weight');
+      document.querySelector('#hidden-bold-parts').remove();
+    `);
+
     // Meta can mount a read conversation as a name-only skeleton and hydrate
     // its months-old preview afterward. A read row can be rehydrated more than
     // once, but without an unread transition none of those changes is new.
@@ -307,29 +338,74 @@ async function run() {
     })()`);
     assert.equal(offscreenRows, 0, 'conversation rows remained geometrically visible');
     publishedStates.length = 0;
-    await win.webContents.executeJavaScript(`
-      document.querySelector('#row-b').setAttribute('data-unread', 'true');
-      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as read');
-      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Background unread message';
-    `);
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => {
+        node.style.fontWeight = '600';
+      });
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Background unread message';
+    })()`);
+    assert.equal(
+      await win.webContents.executeJavaScript(`
+        !document.querySelector('#row-b').hasAttribute('data-unread')
+          && document.querySelector('#row-b button').getAttribute('aria-label') === 'Mark as unread'
+      `),
+      true,
+      'visual unread regression accidentally retained a semantic unread marker',
+    );
     await waitFor(
       () => publishedStates.some((state) => state.notify && state.message?.threadId === 'b'),
-      'background unread message was suppressed',
+      'font-weight unread message was suppressed',
     );
-    await win.webContents.executeJavaScript(`
-      document.querySelector('#row-b').setAttribute('data-unread', 'false');
-      document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
-      document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
-      document.querySelectorAll('#live-nav a.thread').forEach((row) => {
-        row.style.removeProperty('transform');
+    await win.webContents.executeJavaScript(`(() => {
+      const row = document.querySelector('#row-b');
+      row.querySelectorAll('[dir="auto"]').forEach((node) => {
+        node.style.removeProperty('font-weight');
       });
-    `);
+      row.querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+      document.querySelectorAll('#live-nav a.thread').forEach((threadRow) => {
+        threadRow.style.removeProperty('transform');
+      });
+    })()`);
     await waitFor(
       () => publishedStates.some((state) => state.count === 1 && !state.notify),
       'background message cleanup missing',
     );
     if (process.argv.includes('--notification-regression-only')) {
-      console.log('DOM notification regression passed: offscreen live rows still notify.');
+      // Meta can temporarily aria-hide the still-live shell behind an overlay.
+      // Keep tracking that selected list while continuing to ignore hidden
+      // duplicate rows inside it.
+      await win.webContents.executeJavaScript(`
+        document.querySelector('#live-nav').setAttribute('aria-hidden', 'true');
+        document.querySelector('#main').setAttribute('aria-hidden', 'true');
+      `);
+      await delay(1100);
+      publishedStates.length = 0;
+      await win.webContents.executeJavaScript(`(() => {
+        const row = document.querySelector('#row-b');
+        row.querySelectorAll('[dir="auto"]').forEach((node) => {
+          node.style.fontWeight = '600';
+        });
+        row.querySelectorAll('[dir="auto"]')[1].textContent = 'Message behind overlay';
+      })()`);
+      await waitFor(
+        () => publishedStates.some((state) => state.count === 2 && state.notify),
+        'connected hidden tracker missed a font-weight unread message',
+      );
+      await win.webContents.executeJavaScript(`(() => {
+        const row = document.querySelector('#row-b');
+        row.querySelectorAll('[dir="auto"]').forEach((node) => {
+          node.style.removeProperty('font-weight');
+        });
+        row.querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+        document.querySelector('#live-nav').removeAttribute('aria-hidden');
+        document.querySelector('#main').removeAttribute('aria-hidden');
+      })()`);
+      await waitFor(
+        () => publishedStates.some((state) => state.count === 1 && !state.notify),
+        'connected hidden tracker cleanup missing',
+      );
+      console.log('DOM notification regression passed: current Meta unread markers notify offscreen and behind overlays.');
       return;
     }
 
