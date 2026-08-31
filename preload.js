@@ -677,8 +677,11 @@ window.addEventListener('DOMContentLoaded', () => {
     // marker. It renders the sender/preview with font-weight 600 instead. Keep
     // this fallback scoped to semantic text inside a Messenger thread link so
     // bold Facebook chrome or general notifications can never affect it.
-    const emphasizedParts = Array.from(link.querySelectorAll('[dir="auto"]'))
-      .filter((node) => !node.querySelector('[dir="auto"]'))
+    const textNodes = Array.from(link.querySelectorAll('[dir="auto"]'))
+      .filter((node) => !node.querySelector('[dir="auto"]'));
+    const calendarFlags = calendarFilterFlags(textNodes);
+    const emphasizedParts = textNodes
+      .filter((_node, index) => !calendarFlags[index])
       .filter((node) => {
         if (!normalizeText(node.textContent)) return false;
         for (let current = node; current; current = current.parentElement) {
@@ -696,7 +699,6 @@ window.addEventListener('DOMContentLoaded', () => {
       // rowDisplayState relies on, so a read thread whose status line also
       // renders semibold can't be mistaken for an unread message preview.
       .filter((node) => !isNonMessageRowText(node.textContent))
-      .filter((node) => !isCalendarRowText(node.textContent))
       .filter((node) => {
         const computed = getComputedStyle(node);
         const fontWeight = Number.parseInt(computed.fontWeight, 10);
