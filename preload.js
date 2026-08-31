@@ -696,6 +696,7 @@ window.addEventListener('DOMContentLoaded', () => {
       // rowDisplayState relies on, so a read thread whose status line also
       // renders semibold can't be mistaken for an unread message preview.
       .filter((node) => !isNonMessageRowText(node.textContent))
+      .filter((node) => !isCalendarRowText(node.textContent))
       .filter((node) => {
         const computed = getComputedStyle(node);
         const fontWeight = Number.parseInt(computed.fontWeight, 10);
