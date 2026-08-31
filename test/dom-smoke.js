@@ -288,7 +288,24 @@ async function run() {
       'later hydration of a stable read row generated a notification',
     );
 
-    // Normal background unread transitions must still notify.
+    // Normal background unread transitions must still notify even when every
+    // structurally live conversation row is currently outside the viewport.
+    const offscreenRows = await win.webContents.executeJavaScript(`(() => {
+      const viewportWidth = window.visualViewport?.width || window.innerWidth;
+      const viewportHeight = window.visualViewport?.height || window.innerHeight;
+      const rows = [...document.querySelectorAll('#live-nav a.thread')];
+      rows.forEach((row) => { row.style.transform = 'translateY(2000px)'; });
+      return rows.filter((row) => {
+        const rect = row.getBoundingClientRect();
+        return rect.width > 1
+          && rect.height > 1
+          && rect.bottom > 0
+          && rect.top < viewportHeight
+          && rect.right > 0
+          && rect.left < viewportWidth;
+      }).length;
+    })()`);
+    assert.equal(offscreenRows, 0, 'conversation rows remained geometrically visible');
     publishedStates.length = 0;
     await win.webContents.executeJavaScript(`
       document.querySelector('#row-b').setAttribute('data-unread', 'true');
@@ -303,11 +320,18 @@ async function run() {
       document.querySelector('#row-b').setAttribute('data-unread', 'false');
       document.querySelector('#row-b button').setAttribute('aria-label', 'Mark as unread');
       document.querySelector('#row-b').querySelectorAll('[dir="auto"]')[1].textContent = 'Seen';
+      document.querySelectorAll('#live-nav a.thread').forEach((row) => {
+        row.style.removeProperty('transform');
+      });
     `);
     await waitFor(
       () => publishedStates.some((state) => state.count === 1 && !state.notify),
       'background message cleanup missing',
     );
+    if (process.argv.includes('--notification-regression-only')) {
+      console.log('DOM notification regression passed: offscreen live rows still notify.');
+      return;
+    }
 
     // A changed preview that remains read must not create a Windows toast the
     // app cannot represent as unread. A following unread marker is tested
