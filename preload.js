@@ -325,22 +325,6 @@ window.addEventListener('DOMContentLoaded', () => {
     .trim()
     .toLowerCase();
 
-  const isElementStructurallyShown = (element) => {
-    if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
-      return false;
-    }
-    for (let node = element; node; node = node.parentElement) {
-      const computed = getComputedStyle(node);
-      if (computed.display === 'none'
-        || computed.visibility === 'hidden'
-        || computed.visibility === 'collapse') {
-        return false;
-      }
-      if (node === document.body) break;
-    }
-    return true;
-  };
-
   const isElementVisible = (element, { allowZeroWidth = false } = {}) => {
     if (!element?.isConnected || element.closest('[hidden], [inert], [aria-hidden="true"]')) {
       return false;
@@ -707,6 +691,11 @@ window.addEventListener('DOMContentLoaded', () => {
         }
         return true;
       })
+      // Exclude latest-activity status lines (reactions, read receipts, typing,
+      // system activity) from the semantic count, using the same classifier
+      // rowDisplayState relies on, so a read thread whose status line also
+      // renders semibold can't be mistaken for an unread message preview.
+      .filter((node) => !isNonMessageRowText(node.textContent))
       .filter((node) => {
         const computed = getComputedStyle(node);
         const fontWeight = Number.parseInt(computed.fontWeight, 10);
